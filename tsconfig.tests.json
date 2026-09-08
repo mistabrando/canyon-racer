@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "test-dist"
+  },
+  "include": [
+    "src/sim.ts",
+    "src/trackgen.ts",
+    "src/ghost.ts",
+    "src/share.ts",
+    "src/visuals.ts",
+    "tests/harness.ts",
+    "tests/physics-feel.ts",
+    "tests/ghost-share.ts",
+    "tests/visuals-budget.ts",
+    "src/environment.ts",
+    "src/render-motion.ts",
+    "tests/render-motion.ts",
+    "src/drift-control.ts",
+    "tests/drift-control.ts",
+    "tests/track-variance.ts",
+    "src/loop.ts",
+    "tests/loop-ui.ts",
+    "tests/trails-bounds.ts",
+    "src/barrier-plan.ts",
+    "tests/barrier-plan.ts",
+    "tests/barrier-edge.ts",
+    "tests/corner-apex.ts"
+  ]
+}

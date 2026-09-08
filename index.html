@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Canyon Daily — drift racer</title>
+<link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud">
+  <div id="topbar">
+    <div id="day">CANYON DAILY</div>
+    <div id="time">0:00.00</div>
+    <div id="best">BEST —</div>
+  </div>
+  <div id="delta"></div>
+  <div id="msg">Tap to drive</div>
+  <div id="split"></div>
+  <div id="progress"><div id="progfill"></div></div>
+</div>
+<div id="debug" class="hidden"></div>
+<div id="touch">
+  <div id="stick"><div id="knob"></div></div>
+  <div id="driftbtn">DRIFT</div>
+  <div id="resetbtn">R</div>
+</div>
+<div id="panel" class="hidden">
+  <div id="panelcard">
+    <h1 id="ptitle">CANYON DAILY</h1>
+    <p id="psub">Point-to-point sprint · auto-gas · steer + drift</p>
+    <div id="presult"></div>
+    <div class="row">
+      <button id="drivebtn">DRIVE</button>
+      <button id="sharebtn">SHARE</button>
+    </div>
+    <p id="phint">PC: ← → steer · ↓ / space drift · R reset<br/>Mobile: left stick steers · DRIFT button slides</p>
+  </div>
+</div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

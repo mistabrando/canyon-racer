@@ -154,12 +154,17 @@ reports, and logs are stored in the project.
 
 | Workstream | Output | Status |
 |---|---|---|
-| Driving feel/red-team | `docs/agents/cycle9-driving.md` | queued |
-| Art/background review | `docs/agents/cycle9-art.md` | queued |
-| Ghost/reward-loop QA | `docs/agents/cycle9-loop.md` | queued |
-| GitHub Pages preparation/publish | `docs/agents/pages-cycle9.md` | queued |
+| Driving feel/red-team | `docs/agents/cycle9-driving.md` | blocked: Meta network |
+| Art/background review | `docs/agents/cycle9-art.md` | blocked: Meta network |
+| Ghost/reward-loop QA | `docs/agents/cycle9-loop.md` | blocked: Meta network |
+| GitHub Pages preparation/publish | `docs/agents/pages-cycle9.md` | prepared; auth/network blocked |
 
 One integrator runs only after the three review reports finish. Pages owns only deployment files.
+
+Cycle 9 launch status: blocked by managed outbound-network policy before Muse could respond.
+Prompts and failed-run logs are preserved under `.muse/`; retry when Meta API access returns.
+Pages is prepared and committed locally at `920a1dc`; remote publish is blocked by the same
+network policy plus an invalid GitHub CLI token for `mistabrando`.
 
 Cycle 6 result: complete. Handbrake yaw/slip impulse, 1–2s deterministic pendulum,
 natural opposite-slide chaining, and timed countersteer damping/slingshot are implemented.

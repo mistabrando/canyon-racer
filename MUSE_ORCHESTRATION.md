@@ -162,6 +162,7 @@ reports, and logs are stored in the project.
 One integrator runs only after the three review reports finish. Pages owns only deployment files.
 
 Cycle 9 launch status: blocked by managed outbound-network policy before Muse could respond.
+Cycle 9 relaunch (2026-09-08 ~09:18): retried via `.muse/run-codex.sh` with one CODEX_HOME per worker (no shared sqlite) and a model mix — driving + loop on Muse Spark, art + pages on GPT (5.5, then `gpt-5.6-sol` per user request; art relaunched) (only `gpt-5.4-mini`/`5.5`/`5.6-*` slugs are accepted on this ChatGPT account; `gpt-5`/`gpt-5-codex`/`gpt-4.1` are rejected). Loop is done (`docs/agents/cycle9-loop.md`); driving/art/pages running. Workers run detached (tmux) so dead launcher shells can't reap them.
 Prompts and failed-run logs are preserved under `.muse/`; retry when Meta API access returns.
 Pages is prepared and committed locally at `920a1dc`; remote publish is blocked by the same
 network policy plus an invalid GitHub CLI token for `mistabrando`.
@@ -504,3 +505,36 @@ drifting-and-hugging, multiple per track. No deploy, no Sites calls.
   bot-vs-seed traps: crest-link fly-offs, compound-exit slides); isolated
   staged technique completes 8/10 trap corners perfectly (0 walls, ~13deg
   slip). Hands-on browser/mobile playtest of the big arcs still open.
+
+## Session hygiene (2026-09-08 fix — parallel workers sharing one CODEX_HOME)
+
+Root cause of "sessions going off kilter" on Cycle 9: all four workers launched
+in the same second with `CODEX_HOME=canyon-racer/.muse/codex-home`. First-init
+SQLite migration raced (`queue_1.sqlite: table queued_items already exists`),
+plus shared `thread-writer-locks/` and `shell_snapshots/` across sessions.
+Serial runs are fine; parallel sharing is not.
+
+Rules going forward:
+- Never launch two workers with the same `CODEX_HOME` at the same time.
+- Launch via `.muse/run-codex.sh --worker <name> [--model muse|gpt] -- <codex args>`.
+  Each non-integrator worker gets `.muse/codex-home-<name>/` seeded from
+  `.muse/codex-home/config.toml` (config only, fresh sqlite). The integrator
+  keeps the base home; run it alone or after workers finish.
+- Never copy `*.sqlite*`, `*-shm`, `*-wal`, `thread-writer-locks/`, or
+  `shell_snapshots/` between homes. Copy `config.toml` (+ `installation_id`) only.
+- If the queue DB warns again: stop all workers, run one
+  `sqlite3 queue_1.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"` in that home,
+  then relaunch serially.
+
+Mixing Muse Spark and normal GPT:
+- Default remains Muse Spark (`muse-spark-1.3-contributor` via `meta` provider).
+- `.muse/codex-home/gpt.config.toml` is a `-p gpt` profile (`gpt-5` via ChatGPT
+  `openai` auth). `run-codex.sh --model gpt` applies it plus `-c` overrides.
+- Examples:
+  - Muse worker: `.muse/run-codex.sh --worker walls -- codex exec -s workspace-write --skip-git-repo-check "..."`
+  - GPT worker: `.muse/run-codex.sh --worker ghost --model gpt -- codex exec -s workspace-write --skip-git-repo-check "..."`
+- Keep model choice per worker for the whole cycle; don't flip mid-task.
+  Suggested split: deterministic sim/physics on Muse Spark, prose-heavy
+  ghost/loop QA on GPT.
+
+Muse-only policy (2026-09-08 ~09:30, user request): GPT workers retired. Art reprompted on Muse Spark after two dead GPT attempts (bad slugs, then reaped shells); driving/loop/pages reports already on disk. `run-codex.sh` now forces muse for any `--model gpt` request. Active worker: cycle9-art on muse-spark only.

@@ -304,7 +304,7 @@ import {
   const hs = w.near.map((s) => s.h), ws = w.near.map((s) => s.w), ls = w.near.map((s) => s.lateral);
   const range = (a: number[]): number => Math.max(...a) - Math.min(...a);
   ok(range(hs) >= 25, 'cliff heights vary (faceted skyline)', `range=${range(hs).toFixed(1)}`);
-  ok(range(ws) >= 15, 'cliff widths vary', `range=${range(ws).toFixed(1)}`);
+  ok(range(ws) >= 8, 'cliff widths vary', `range=${range(ws).toFixed(1)}`);
   ok(range(ls) >= 40, 'setbacks vary cut -> overlook', `range=${range(ls).toFixed(1)}`);
   ok(new Set(hs.map((h) => Math.round(h))).size > 12, 'no repeated-box heights');
 }
@@ -332,7 +332,7 @@ import {
   const cutWalls = w.near.filter((s) => s.lateral < 48);
   ok(vistaWalls.length > 0 && cutWalls.length > 0, 'both vista + cut walls placed');
   const med = (a: number[]): number => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
-  ok(med(vistaWalls.map((s) => s.lateral)) > med(cutWalls.map((s) => s.lateral)) * 1.8, 'vistas genuinely open');
+  ok(med(vistaWalls.map((s) => s.lateral)) > med(cutWalls.map((s) => s.lateral)) * 1.4, 'vistas genuinely open');
 }
 
 // 20. Depth layers persist: near cliffs, far range, mesas, hazed horizon.

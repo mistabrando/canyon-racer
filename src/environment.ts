@@ -86,7 +86,7 @@ export const CORRIDOR = {
   SCRUB_OUT: 3.1,   // scrub crown must clear the guardrail outer face + margin
   CURVE_EXTRA: 3.0, // chord-cut margin for walls inside a corner (L~29u, R>=35)
   JITTER: 0.6,      // faceted-vertex jitter bound
-  PUSHBACK: 6,      // extra setback for near-road scenery so the track reads first
+  PUSHBACK: 14,     // extra setback: cliffs stay off the road so the track reads first
 } as const;
 
 // Centerline distance that must stay clear of solid geometry.
@@ -255,10 +255,10 @@ export function planWalls(
       // Corner-inside sightline caps still apply when the cliff falls inside.
       n++;
       const side = hash01(si * 29 + 1) < 0.5 ? -1 : 1;
-      let h = 18 + hash01(n * 2 + 2) * 36;
+      let h = 12 + hash01(n * 2 + 2) * 20;
       if (corner && side === insideOf(corner)) h = Math.min(h, SIGHTLINE.INSIDE_HEIGHT_CAP);
-      const w = 14 + hash01(n * 2 + 3) * 22;
-      const segLen = o.wallStep * 2.6;
+      const w = 8 + hash01(n * 2 + 3) * 12;
+      const segLen = o.wallStep * 2.0;
       const yaw = (hash01(n * 3 + 5) - 0.5) * 0.9;
       const inside = corner !== null && side === insideOf(corner);
       // Exclusion envelope: no vertex inside the road/guardrail corridor.
@@ -274,11 +274,11 @@ export function planWalls(
       const phraseScale = 0.72 + phrase * 0.65;
       for (const side of [1, -1]) {
         n++;
-        let h = (22 + hash01(n * 2 + 2) * 30) * phraseScale;
+        let h = (14 + hash01(n * 2 + 2) * 18) * phraseScale;
         const inside = corner !== null && side === insideOf(corner);
         if (inside) h = Math.min(h, SIGHTLINE.INSIDE_HEIGHT_CAP);
-        const w = 10 + hash01(n * 2 + 3) * 14;
-        const segLen = o.wallStep * 2.2;
+        const w = 6 + hash01(n * 2 + 3) * 8;
+        const segLen = o.wallStep * 1.6;
         const yaw = (hash01(n * 3 + 5) - 0.5) * 0.9;
         // Exclusion envelope replaces the old center-only lateral floors.
         const lateral = Math.max(

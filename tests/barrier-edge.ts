@@ -321,5 +321,23 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   ok(s2.vz >= 0, 'start-line backward speed killed', `vz=${s2.vz.toFixed(1)}`);
 }
 
+// 11. Rail span starts are not invisible walls: the clamp guard must be
+// evaluated at the car course position, not at lastIdx (nearest sample to
+// the car center, which trails wall contact, firing up to ~8u early).
+{
+  const tr = straight();
+  tr.barrier = { spans: [{ aS: 200, bS: 400, side: 1 }], length: tr.cum[tr.cum.length - 1] };
+  const s = createSimState();
+  resetRun(s, tr, 0);
+  placeOut(s, tr, 190, LIM - 0.3, 2, 40);
+  let hit = false;
+  for (let k = 0; k < 6; k++) { if (simStep(s, tr, drive, DT).wallHit) hit = true; }
+  ok(!hit, 'span start is not an early invisible wall');
+  placeOut(s, tr, 250, LIM - 0.5, 30);
+  let gHit = false;
+  for (let k = 0; k < 8 && !gHit; k++) { if (simStep(s, tr, drive, DT).wallHit) gHit = true; }
+  ok(gHit, 'span interior still collides');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

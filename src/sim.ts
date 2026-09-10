@@ -621,7 +621,13 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   // guards exactly its spans. Open edges skip clamp and impact entirely so
   // the car leaves the road — the departure above owns the fall, offroad
   // drag and OOB below own the cost. No wallHit fires without a rail.
-  const guarded = tr.barrier && tr.cum ? barrierAt(tr.barrier, tr.cum[j] ?? 0, bSide) : true;
+  // Car-frame query: the clamp acts at the car's own course position (j is
+  // the nearest sample to the CENTER, which lags wall contact on curves), so
+  // a rail span that starts just ahead never collides early as an invisible
+  // wall. Project the car onto j's frame for s, clamp into the plan window.
+  const rx = s.px - tr.x[j], rz = s.pz - tr.z[j];
+  const sCar = tr.cum ? clamp(tr.cum[j] + rx * tr.tx[j] + rz * tr.tz[j], 0, tr.barrier ? tr.barrier.length : tr.cum[tr.cum.length - 1]) : 0;
+  const guarded = tr.barrier && tr.cum ? barrierAt(tr.barrier, sCar, bSide) : true;
   if (Math.abs(lat2) > LIM && guarded) {
     const push = Math.abs(lat2) - LIM;
     const sg = Math.sign(lat2);

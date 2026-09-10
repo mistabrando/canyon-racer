@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import {
   clamp, lerp, hashSeed, mulberry32,
   trackFromPoints, TouchState, interpPose, updateDisplay,
-  createSimState, resetRun, simStep,
+  createSimState, resetRun, simRespawn, simStep,
 } from './sim';
 import type { StepInfo } from './sim';
 import { decodeGhost, encodeGhost, sampleGhost, rivalLabel, makeExpectedTrack, resolveRivalIdentity } from './ghost';
@@ -16,7 +16,7 @@ import {
   shareRun, shouldUseNativeShare,
 } from './share';
 import { acceptDailyTrack, TRACK_HALF_W, arcLengths, markerStations } from './trackgen';
-import { planBarriers } from './barrier-plan';
+import { planBarriers, barrierAt } from './barrier-plan';
 import {
   mountVisuals, trailTarget, trailSmooth, trailWidth, trailLength,
   trailShade, trailSpawnEvery, dustBurst, dustSpread,
@@ -185,10 +185,23 @@ function ribbon(width: number, yOff: number, colorFn: (i: number, side: number) 
 const asphalt = new THREE.Color(0x3d3a40);
 const asphalt2 = new THREE.Color(0x45424a);
 scene.add(ribbon(HALF_W, 0.15, (i) => (Math.floor(cum[i] / 40) % 2 ? asphalt : asphalt2)));
+// Dirt apron: pale engineered roadbed hugging the ribbon (parallels the road
+// exactly, so it can never intersect corridor-kept scenery). Grounds the road
+// against the desert floor instead of a hard asphalt/rock line.
+scene.add(ribbon(HALF_W + 4, 0.05, () => new THREE.Color(0xc98d54)));
+// Curb ribbon doubles as the open-edge cue: stations with no visible rail on a
+// side read pale sand there instead of red/white, so fall-possible edges look
+// deliberately different from walled ones. Same geometry, no new draw calls.
+const sandPale = new THREE.Color(0xe8d3a8);
+const curbRed = new THREE.Color(0xd83a2a);
+const curbWhite = new THREE.Color(0xf2ede2);
 scene.add(ribbon(HALF_W + 1.1, 0.12, (i, side) => {
   const k = Math.floor(cum[i] / 14) % 2;
-  void side;
-  return k ? new THREE.Color(0xd83a2a) : new THREE.Color(0xf2ede2);
+  const base = k ? curbRed : curbWhite;
+  if (track.barrier && !barrierAt(track.barrier, cum[i], side >= 0 ? 1 : -1)) {
+    return base.clone().lerp(sandPale, 0.6);
+  }
+  return base;
 }));
 // center dashes
 {
@@ -608,11 +621,19 @@ function placeAt(i: number) {
   snapView = true;
 }
 function doRespawn() {
-  // R RESET: full restart from the beginning (fresh countdown, fresh timer).
-  // simRespawn (snapshot +3s) is kept for the headless autopilot, but players
-  // always restart the run — a single unambiguous reset.
-  if (state !== 'run' && state !== 'finish') return;
-  startRun(true); // R = one-input instant restart, same deterministic reset
+  // R RESET: mid-run rescue to the last clean snapshot (instant, +3000ms race
+  // penalty with an honest ghost-timestamp gap). Falling off an open edge no
+  // longer discards the run. From the finish panel R retries the run instead
+  // (nothing to rescue once finished — simRespawn is a no-op there).
+  if (state === 'finish') { startRun(true); return; }
+  if (state !== 'run') return;
+  simRespawn(sim);
+  syncCarTransform();
+  resetMotion(motion, DEFAULT_TUNING, sim.px, sim.py, sim.pz, sim.heading);
+  trailSm = 0;
+  trailTick = 0;
+  snapView = true;
+  msgEl.textContent = '';
 }
 placeAt(0);
 camera.position.set(sim.px - 10, sim.py + 6, sim.pz - 10);
@@ -709,6 +730,16 @@ function finishRun() {
     best = finalMs;
     try { localStorage.setItem(bestKey, String(best)); } catch { /* quota */ }
     try { localStorage.setItem(`canyon-ghost-${day}`, encodeGhost(sim.rec, finalMs, GHOST_URL_BUDGET, expectedTrack)); } catch { /* quota */ }
+    // Session-live rival: the next retry races the new best immediately, no
+    // reload. Fail-closed semantics unchanged (bad data races nothing).
+    try {
+      const fresh = decodeGhost(localStorage.getItem(`canyon-ghost-${day}`));
+      pbGhost = fresh && fresh.p.length > 1 ? fresh : null;
+      const decision = resolveRivalIdentity({ shared: parsed.ghost, pb: pbGhost, expected: expectedTrack });
+      rival = decision.rival;
+      sharedGhost = rival ? rival.ghost : null;
+      rivalNotice = decision.notice;
+    } catch { /* keep previous rival */ }
   }
   refreshBest();
   const isRecord = best === finalMs;

@@ -99,6 +99,7 @@ export const FINISH_TAIL = 60;
 // instead of snapping. OOB fires after a short sustained interval so the
 // main loop can show R RESET; respawn itself stays manual and deterministic.
 export const EDGE_SHOULDER = 3.5;
+export const BACKSTOP_RADIUS = 40;
 export const OOB_EXTRA_LAT = 15;
 export const OOB_FALL_DEPTH = 10;
 export const OOB_ARM_MS = 900;
@@ -689,11 +690,16 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     if (Math.abs(latJ) > tr.halfW + OOB_EXTRA_LAT || deep) s.oobMs += dt * 1000;
     else s.oobMs = Math.max(0, s.oobMs - 2 * dt * 1000);
   }
-  // start backstop: don't drive off behind the start line
+  // start backstop: don't drive off behind the start line. Gated on
+  // proximity to the start sample: a half-plane test alone misfires on
+  // loop-back track sections hundreds of units away that happen to cross
+  // the start plane (they read as "behind the start" and eat all backward
+  // velocity). Genuine start-line reversals happen within metres of the
+  // start; the car auto-accelerates forward and has no reverse.
   {
     const rbx = s.px - tr.x[0], rbz = s.pz - tr.z[0];
     const rel = rbx * tr.tx[0] + rbz * tr.tz[0];
-    if (rel < -3) {
+    if (rel < -3 && rbx * rbx + rbz * rbz < BACKSTOP_RADIUS * BACKSTOP_RADIUS) {
       s.px -= tr.tx[0] * (rel + 3); s.pz -= tr.tz[0] * (rel + 3);
       const bv = s.vx * tr.tx[0] + s.vz * tr.tz[0];
       if (bv < 0) { s.vx -= tr.tx[0] * bv; s.vz -= tr.tz[0] * bv; }

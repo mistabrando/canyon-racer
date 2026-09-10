@@ -5,7 +5,7 @@
 declare const process: { exit(c: number): void };
 import {
   createSimState, resetRun, simRespawn, simStep, trackFromPoints, wallLimit,
-  EDGE_SHOULDER, OOB_ARM_MS, RESPAWN_PENALTY_MS,
+  BACKSTOP_RADIUS, EDGE_SHOULDER, OOB_ARM_MS, RESPAWN_PENALTY_MS,
 } from '../src/sim.js';
 import type { SimState, StepInput, TrackView } from '../src/sim.js';
 import { barrierAt, planBarriers } from '../src/barrier-plan.js';
@@ -284,6 +284,41 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   simRespawn(s);
   const info = simStep(s, tr, drive, DT);
   ok(info.oobMs === 0, 'OOB decays on clean road');
+}
+
+// 10. Start-backstop proximity gate: loop-back sections far from the start
+// that cross the start plane must not trigger the backstop (it ate all
+// backward velocity and stalled the car); genuine start-line reversals
+// within metres of the start are still blocked.
+{
+  const tr = straight(1200);
+  tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
+  // Far point behind the start plane: x/z hundreds of units away laterally.
+  const s = createSimState();
+  resetRun(s, tr, 0);
+  s.lastIdx = 300;
+  s.px = 300; s.pz = -5; s.py = tr.y[300] + 0.2;
+  s.vx = 0; s.vz = -70; s.vy = 0; s.grounded = true;
+  s.heading = Math.PI;
+  s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading;
+  const relFar = (s.px - tr.x[0]) * tr.tx[0] + (s.pz - tr.z[0]) * tr.tz[0];
+  ok(relFar < -3, 'far probe is behind the start plane', `rel=${relFar.toFixed(1)}`);
+  const info = simStep(s, tr, drive, DT);
+  ok(!info.finished, 'far probe takes a normal step');
+  ok(s.vz < -60, 'far loop-back keeps backward velocity', `vz=${s.vz.toFixed(1)}`);
+  // Near start, behind the plane: still pushed back, backward speed killed.
+  const s2 = createSimState();
+  resetRun(s2, tr, 0);
+  s2.px = tr.x[0]; s2.pz = tr.z[0] - 5; s2.py = tr.y[0] + 0.2;
+  s2.vx = 0; s2.vz = -10; s2.vy = 0; s2.grounded = true;
+  s2.heading = Math.PI;
+  s2.px0 = s2.px; s2.py0 = s2.py; s2.pz0 = s2.pz; s2.h0 = s2.heading;
+  const d2 = Math.hypot(s2.px - tr.x[0], s2.pz - tr.z[0]);
+  ok(d2 < BACKSTOP_RADIUS, 'near probe is inside the backstop radius', `d=${d2.toFixed(1)}`);
+  simStep(s2, tr, drive, DT);
+  const rel2 = (s2.px - tr.x[0]) * tr.tx[0] + (s2.pz - tr.z[0]) * tr.tz[0];
+  ok(rel2 >= -3 - 1e-9, 'start-line reversal pushed back', `rel=${rel2.toFixed(2)}`);
+  ok(s2.vz >= 0, 'start-line backward speed killed', `vz=${s2.vz.toFixed(1)}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

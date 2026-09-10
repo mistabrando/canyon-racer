@@ -1,23 +1,22 @@
 # GitHub Pages deployment
 
-The project is configured for a repository Pages URL using Vite's project asset base:
-`/canyon-racer/`.
+Live: `https://mistabrando.github.io/canyon-racer/`
 
-Expected repository: `mistabrando/canyon-racer`
+- Repo: `mistabrando/canyon-racer`, source code on `main`, built site on `gh-pages`.
+- Vite uses `base: '/canyon-racer/'` so assets resolve under the project path.
+- Pages source: **Deploy from a branch**, branch `gh-pages`, folder `/`.
+- GitHub Actions is NOT used (account can't run Actions due to a billing lock), so there is no `.github/workflows/pages.yml`.
 
-Expected URL: `https://mistabrando.github.io/canyon-racer/`
-
-The workflow in `.github/workflows/pages.yml` runs the tests, builds `dist`, uploads the
-Pages artifact, and deploys it with the official GitHub Pages Actions flow. Repository
-Pages must use **GitHub Actions** as its source.
-
-Local verification:
+Republish after changing the game:
 
 ```sh
-npm ci
-npm test
+cd canyon-racer
 npm run build
-npm run preview -- --host 127.0.0.1 --port 4173
+git worktree add /tmp/canyon-pages origin/gh-pages
+cp dist/index.html dist/assets /tmp/canyon-pages/ -r
+# ensure /tmp/canyon-pages/.nojekyll exists
+git -C /tmp/canyon-pages add -A
+git -C /tmp/canyon-pages commit -m "Republish"
+git -C /tmp/canyon-pages push origin HEAD:gh-pages
+git worktree remove --force /tmp/canyon-pages
 ```
-
-Publishing is blocked until `gh auth login -h github.com` succeeds for `mistabrando`.

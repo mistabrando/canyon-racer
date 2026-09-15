@@ -4,38 +4,73 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>Canyon Daily — drift racer</title>
-  <script type="module" crossorigin src="/canyon-racer/assets/index-DmFyap4s.js"></script>
-  <link rel="stylesheet" crossorigin href="/canyon-racer/assets/index-D_g2iUyn.css">
+  <script type="module" crossorigin src="/canyon-racer/assets/index-CWEi8Eqf.js"></script>
+  <link rel="stylesheet" crossorigin href="/canyon-racer/assets/index-BTemfRy9.css">
 </head>
 <body>
 <canvas id="game"></canvas>
 <div id="hud">
   <div id="topbar">
     <div id="day">CANYON DAILY</div>
-    <div id="time">0:00.00</div>
+    <div id="timewrap">
+      <div id="time">0:00.00</div>
+      <div id="speed">0 km/h</div>
+    </div>
     <div id="best">BEST —</div>
   </div>
   <div id="delta"></div>
   <div id="msg">Tap to drive</div>
+  <div id="exitfb"></div>
+  <div id="lesson"></div>
+  <div id="penalty"></div>
   <div id="split"></div>
   <div id="progress"><div id="progfill"></div></div>
 </div>
 <div id="debug" class="hidden"></div>
+<button id="retrybtn" aria-label="Retry the full run">&#8635; RETRY</button>
 <div id="touch">
   <div id="stick"><div id="knob"></div></div>
   <div id="driftbtn">DRIFT</div>
-  <div id="resetbtn">R</div>
+  <div id="resetbtn">RESCUE</div>
+</div>
+<div id="pauseoverlay" class="hidden">
+  <div id="pausecard">
+    <h2>PAUSED</h2>
+    <div class="row">
+      <button id="resumebtn">RESUME</button>
+      <button id="pausemenubtn">MENU</button>
+    </div>
+  </div>
+</div>
+<div id="playctrl">
+  <button id="pauseplaybtn" aria-label="Pause or resume">PAUSE</button>
+  <button id="stopbtn" aria-label="Stop and return to the menu">MENU</button>
 </div>
 <div id="panel" class="hidden">
   <div id="panelcard">
     <h1 id="ptitle">CANYON DAILY</h1>
+    <p id="pdate"></p>
     <p id="psub">Point-to-point sprint · auto-gas · steer + drift</p>
+    <div id="moderow">
+      <button id="modedaily" class="modebtn">DAILY</button>
+      <button id="modepractice" class="modebtn">DRIFT PRACTICE</button>
+      <button id="modebenchmark" class="modebtn">BENCHMARK</button>
+    </div>
+    <div id="ptargets"></div>
     <div id="presult"></div>
     <div class="row">
       <button id="drivebtn">DRIVE</button>
       <button id="sharebtn">SHARE</button>
     </div>
-    <p id="phint">PC: ← → steer · ↓ / space drift · R reset<br/>Mobile: left stick steers · DRIFT button slides</p>
+    <div class="row" id="refrow">
+      <button id="racebtn" class="hidden">RACE REFERENCE</button>
+      <button id="referencebtn" class="hidden">WATCH REFERENCE</button>
+    </div>
+    <p id="phint">PC: ← → steer · ↓ / space drift · R rescue (+3s) · Enter retry<br/>Mobile: left stick steers · DRIFT button slides · RESCUE returns to the track (+3s) · RETRY restarts</p>
+    <div id="ctrlrow">
+      <button id="mutebtn" aria-label="Toggle sound">SOUND ON</button>
+      <button id="fsbtn" aria-label="Toggle fullscreen">FULLSCREEN</button>
+    </div>
   </div>
 </div>
 </body>

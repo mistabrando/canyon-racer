@@ -3,6 +3,10 @@
 // The game copies MotionState fields into the camera each frame; tests drive it
 // headless with synthetic pose streams.
 //
+// Speed feel normalization reads the ACTUAL physics envelope from ./sim.ts and
+// ./drift-control.ts (SPEED_FULL) rather than a stale hard-coded 80, so the
+// camera FOV ramp follows the tuned cruise/exit speeds automatically.
+//
 // Why this exists: the chase camera used to aim with the raw interpolated body
 // heading, so every drift yaw-rate spike whipped both the camera anchor and the
 // look target. FOV targets stepped on drift enter/exit, a Vector3 was allocated
@@ -14,6 +18,13 @@
 // updateMotion allocates nothing: all state lives in MotionState. Feedforward
 // cancels the spring lag including the integrator's one-frame lead, so framing
 // does not depend on refresh rate.
+
+// Full-speed reference for FOV normalization comes from the ACTUAL physics
+// envelope (top grip/boost speeds), never a stale hard-coded 80, so camera and
+// audio speed response track the tuned cruise/exit speeds automatically.
+import { MAX_GRIP_SPEED } from './sim.js';
+import { BOOST_SPEED_CAP } from './drift-control.js';
+export const SPEED_FULL = Math.max(MAX_GRIP_SPEED, BOOST_SPEED_CAP);
 
 export interface MotionTuning {
   posLambda: number;
@@ -44,14 +55,17 @@ export const DEFAULT_TUNING: MotionTuning = {
   feedforward: 1,
   maxImpulse: 1.2,
   impulseDecay: 5,
-  camDist: 11.5,
-  camHeight: 4.6,
-  lookAhead: 9,
-  lookHeight: 1.4,
-  baseFov: 62,
-  speedFov: 14,
-  driftFov: 5,
-  fullSpeed: 60,
+  // Lower, closer chase camera with a longer sightline ahead, and a stronger
+  // but still bounded speed-FOV ramp. Normalized against SPEED_FULL (the real
+  // physics envelope) so the top of the range actually reaches full effect.
+  camDist: 8.8,
+  camHeight: 3.5,
+  lookAhead: 12,
+  lookHeight: 1.2,
+  baseFov: 60,
+  speedFov: 32,
+  driftFov: 7,
+  fullSpeed: SPEED_FULL,
   maxDt: 0.05,
 };
 

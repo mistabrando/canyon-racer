@@ -86,12 +86,12 @@ export const DEFAULT_DRIFT_TUNING: DriftTuning = {
   counterHi: 0.7,
   abortSpeed: 15,
   cooldownS: 1.2,
-  boostTime: 0.6,
-  boostAccelMax: 20,
-  kickRad: 0.09,
+  boostTime: 0.7,
+  boostAccelMax: 24,
+  kickRad: 0.11,
   pendFreq: 7.0,
   pendDecay: 1.8,
-  pendYaw: 1.6,
+  pendYaw: 1.8,
   chainWindow: 0.8,
   chainHold: 0.35,
   chainMin: 0.25,
@@ -99,8 +99,8 @@ export const DEFAULT_DRIFT_TUNING: DriftTuning = {
 };
 
 /** Grip top speed and the brief controlled overshoot the boost may reach. */
-export const GRIP_TOP_SPEED = 80;
-export const BOOST_SPEED_CAP = 84;
+export const GRIP_TOP_SPEED = 140;
+export const BOOST_SPEED_CAP = 162;
 
 export interface DriftState {
   phase: DriftPhase;
@@ -132,6 +132,13 @@ export interface DriftStepInput {
   speed: number;
   slipDeg: number;
   grounded: boolean;
+  /**
+   * True while the car is over the asphalt road (not the dirt verge/plain).
+   * Off-road the rhythm machine earns nothing: no entries, no graded exits, no
+   * slingshot. It cancels stored boost and aborts the slide so nothing can be
+   * cashed back on asphalt. Steering/momentum stay sim-side.
+   */
+  onRoad: boolean;
 }
 
 export interface DriftStepOut {
@@ -239,6 +246,21 @@ export function updateDrift(s: DriftState, t: DriftTuning, inp: DriftStepInput, 
 
   if (s.boostT > 0) s.boostT = Math.max(0, s.boostT - dt);
   s.boostAccel = s.boostT > 0 ? s.boostAccel : 0;
+
+  // Off-road (dirt verge/plain): the rhythm machine earns nothing. Cancel any
+  // stored boost, drop reward and exit/chain latches, and abort the slide so a
+  // return to asphalt cannot cash a dirt-earned charge. Handbrake edges above
+  // are still tracked so road re-entry can re-arm cleanly.
+  if (!inp.onRoad) {
+    s.boostT = 0; s.boostAccel = 0;
+    s.lastQuality = 0; s.lastGrade = 'none';
+    s.phase = 'idle'; s.slideAge = 0; s.peakSlipDeg = 0; s.needNeutral = false;
+    s.chainDir = 0; s.chainT = 0; s.chainHoldT = 0;
+    s.pendAmp = 0; s.pendPhase = 0;
+    s.slideBlend = Math.max(0, s.slideBlend - t.slideRelease * dt);
+    out.phase = 'idle'; out.slideBlend = s.slideBlend; out.boostAccel = 0;
+    return;
+  }
 
   if (!inp.grounded) {
     // Airborne: pendulum, slide, cooldown, and chain clocks all freeze, but

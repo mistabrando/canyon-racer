@@ -16,7 +16,7 @@ function ok(cond: boolean, name: string, detail = '') {
 const T = DEFAULT_DRIFT_TUNING;
 const DT = 1 / 60;
 
-function step(s: DriftState, o: DriftStepOut, p: Partial<{ dt: number; steer: number; hand: boolean; speed: number; slip: number; grounded: boolean }> = {}): void {
+function step(s: DriftState, o: DriftStepOut, p: Partial<{ dt: number; steer: number; hand: boolean; speed: number; slip: number; grounded: boolean; onRoad: boolean }> = {}): void {
   updateDrift(s, T, {
     dt: p.dt ?? DT,
     steer: p.steer ?? 0.6,
@@ -24,6 +24,7 @@ function step(s: DriftState, o: DriftStepOut, p: Partial<{ dt: number; steer: nu
     speed: p.speed ?? 60,
     slipDeg: p.slip ?? 12,
     grounded: p.grounded ?? true,
+    onRoad: p.onRoad ?? true,
   }, o);
 }
 
@@ -236,34 +237,18 @@ function enterSlide(s: DriftState, o: DriftStepOut, dir = 1): string[] {
   ok(s.phase === 'idle' && o.event === 'expired', 'slow abort forgiving');
 }
 
-// 18. Slingshot sizing: strong but capped, brief, and weak exits stay small.
+// 18. Slingshot sizing: a bounded overshoot above grip top, paid from the
+// module's own boost budget (sim owns how the speed is actually applied).
 {
-  const k = 50 / (GRIP_TOP_SPEED * GRIP_TOP_SPEED);
-  function project(v0: number, boost: number): { peak: number; over80: number; over805: number } {
-    let v = v0, peak = v0, over = 0;
-    const bt = Math.round(0.6 / DT);
-    for (let i = 0; i < 600; i++) {
-      const a = i < bt ? 50 + boost : 50;
-      v += (a - k * v * v) * DT;
-      peak = Math.max(peak, v);
-      if (v > 80) over += DT;
-    }
-    let over805 = 0;
-    v = v0;
-    for (let i = 0; i < 600; i++) {
-      const a = i < bt ? 50 + boost : 50;
-      v += (a - k * v * v) * DT;
-      if (v > 80.5) over805 += DT;
-    }
-    return { peak, over80: over, over805 };
-  }
-  const strong = project(68, T.boostAccelMax * 0.92);
-  console.log(`info - perfect-exit projection: peak=${strong.peak.toFixed(1)} over80=${strong.over80.toFixed(2)}s`);
-  ok(strong.peak >= 79 && strong.peak <= 83, 'perfect exit peaks inside cap', strong.peak.toFixed(1));
-  ok(strong.over805 < 2.0, 'margin above 80.5 is brief', strong.over805.toFixed(2));
-  const weak = project(68, T.boostAccelMax * 0.2);
-  ok(weak.peak < 80.5, 'weak exit stays small', weak.peak.toFixed(1));
-  ok(T.boostTime === 0.6 && GRIP_TOP_SPEED === 80 && BOOST_SPEED_CAP === 84, 'sizing constants pinned');
+  ok(BOOST_SPEED_CAP > GRIP_TOP_SPEED, 'boost cap overshoots grip top');
+  ok(BOOST_SPEED_CAP - GRIP_TOP_SPEED >= 10, 'overshoot is meaningful', `${BOOST_SPEED_CAP - GRIP_TOP_SPEED}u/s`);
+  const s = createDriftState(), o = createDriftOut();
+  enterSlide(s, o);
+  for (let i = 0; i < 21; i++) step(s, o, { slip: 20 });
+  step(s, o, { steer: -0.8, slip: 4, speed: 62 });
+  ok(o.event === 'exit' && o.quality >= 0.8 && o.boostAccel >= 0.75 * T.boostAccelMax,
+    'strong exit pays near-max boost', `q=${o.quality.toFixed(2)} boost=${o.boostAccel.toFixed(1)}`);
+  ok(T.boostTime === 0.7 && GRIP_TOP_SPEED === 140 && BOOST_SPEED_CAP === 162, 'sizing constants pinned');
 }
 
 // 19. Scoring unit boundaries.
@@ -444,7 +429,7 @@ function enterSlide(s: DriftState, o: DriftStepOut, dir = 1): string[] {
       const t = k * dt;
       const hand = t >= 0.1 && t < 0.25;
       const steer = t < 1.0 ? 0.6 : -0.7;
-      updateDrift(s, T, { dt, steer, handbrake: hand, speed: 60, slipDeg: 15, grounded: true }, o);
+      updateDrift(s, T, { dt, steer, handbrake: hand, speed: 60, slipDeg: 15, grounded: true, onRoad: true }, o);
       if (o.event !== 'none') ev.push(o.event);
     }
     return { ev: ev.join(','), amp: s.pendAmp, phase: s.pendPhase };
@@ -489,6 +474,118 @@ function enterSlide(s: DriftState, o: DriftStepOut, dir = 1): string[] {
   enterSlide(s, o);
   resetDrift(s);
   ok(s.pendAmp === 0 && s.pendPhase === 0 && s.chainDir === 0 && s.chainT === 0 && s.chainHoldT === 0, 'reset clears pendulum/chain');
+}
+// 31. Drift-flow: small corrections never commit, decisive flicks do.
+// P1 evidence: below-threshold opposite steer (single steps and repeated
+// multi-frame blips) holds a developed slide; threshold-or-beyond commits
+// immediately; the later deliberate exit still earns a full reward.
+{
+  const th = T.exitOppSteer;
+  const s = createDriftState(), o = createDriftOut();
+  enterSlide(s, o);
+  for (let i = 0; i < 10; i++) step(s, o, { slip: 20 });
+  let committed = false;
+  for (const m of [0.1, 0.2, 0.3]) {
+    step(s, o, { steer: -m, slip: 14, speed: 60 });
+    if (o.event !== 'none') committed = true;
+  }
+  ok(!committed && s.phase === 'sliding', 'sub-threshold opposites never commit');
+  for (let i = 0; i < 6; i++) step(s, o, { steer: -(th - 0.05), slip: 14 });
+  ok(s.phase === 'sliding' && o.event === 'none', 'repeated near-threshold blips hold the slide');
+  for (let i = 0; i < 20; i++) step(s, o, { steer: 0.6, slip: 18 });
+  step(s, o, { steer: -0.8, slip: 4, speed: 62 });
+  ok(o.event === 'exit' && o.quality > 0.8, `deliberate exit after corrections still perfect (q=${o.quality.toFixed(3)})`);
+  const c = createDriftState(), oc = createDriftOut();
+  enterSlide(c, oc);
+  for (let i = 0; i < 10; i++) step(c, oc, { slip: 20 });
+  step(c, oc, { steer: -th, slip: 5, speed: 60 });
+  ok(oc.event === 'exit', 'threshold opposite commits immediately');
+}
+
+// 32. Drift-flow: alternating bends re-enter through the chain window.
+// P1 evidence: an anti-phase developed exit arms one chained opposite
+// slide; a tap with the swing inside the window enters instantly and earns
+// its own reward (one per slide); a tap after the window lapses but inside
+// cooldown is rejected as spam; after cooldown + neutral the tap enters
+// with full energy.
+{
+  const s = createDriftState(), o = createDriftOut();
+  // Fast-develop entry: 2-step tap + 25 ramp steps (age ~0.43s) keeps
+  // pendulum energy high at an anti-phase commit, like a real S-bend flick.
+  step(s, o, { steer: 0.6, hand: true, slip: 5 });
+  step(s, o, { steer: 0.6, hand: false, slip: 6 });
+  for (let i = 0; i < 25; i++) step(s, o, { steer: 0.6, slip: 6 + (20 - 6) * (i / 25) });
+  step(s, o, { steer: -0.8, slip: 4, speed: 62 });
+  const q1 = o.quality;
+  ok(o.event === 'exit' && q1 > 0.8, `control: developed exit rewarded (q=${q1.toFixed(3)})`);
+  ok(o.chainArmed && s.chainDir === -1, 'anti-phase exit arms one chained opposite slide');
+  const ev: string[] = [];
+  for (let i = 0; i < 12; i++) step(s, o, { steer: 0, slip: 2 });
+  for (let i = 0; i < 5; i++) { step(s, o, { steer: -0.6, hand: true, slip: 10 }); ev.push(o.event); }
+  step(s, o, { steer: -0.6, hand: false, slip: 10 }); ev.push(o.event);
+  ok(ev.includes('entered') && s.phase === 'sliding' && s.entryDir === -1, 'chain-window tap enters the opposite slide');
+  for (let i = 0; i < 25; i++) step(s, o, { steer: -0.6, slip: 6 + (20 - 6) * (i / 25) });
+  step(s, o, { steer: 0.8, slip: 4, speed: 62 });
+  ok(o.event === 'exit' && o.quality > 0.8, `chained slide earns its own reward (q=${o.quality.toFixed(3)})`);
+
+  const w = createDriftState(), ow = createDriftOut();
+  enterSlide(w, ow);
+  for (let i = 0; i < 21; i++) step(w, ow, { slip: 20 });
+  step(w, ow, { steer: -0.8, slip: 4, speed: 62 });
+  for (let i = 0; i < 60; i++) step(w, ow, { steer: 0, slip: 2 }); // 1.0s: chain lapsed, cooldown live
+  const spamBefore = w.spamCount;
+  for (let i = 0; i < 5; i++) step(w, ow, { steer: -0.6, hand: true, slip: 6 });
+  step(w, ow, { steer: -0.6, hand: false, slip: 6 });
+  ok(ow.event !== 'entered' && w.spamCount > spamBefore, 'post-window tap inside cooldown rejected as spam');
+  for (let i = 0; i < 30; i++) step(w, ow, { steer: 0, slip: 2 }); // cooldown drains, neutral passes in idle
+  const evW: string[] = [];
+  for (let i = 0; i < 5; i++) { step(w, ow, { steer: -0.6, hand: true, slip: 6 }); evW.push(ow.event); }
+  step(w, ow, { steer: -0.6, hand: false, slip: 6 });
+  ok(evW[0] === 'entered' && w.phase === 'sliding' && w.pendAmp > 0.8, 'cooldown + neutral re-arms a full-energy slide');
+}
+
+// 33. Drift-flow: correction/exit scripts replay identically.
+{
+  function script(): string {
+    const s = createDriftState(), o = createDriftOut();
+    const out: string[] = [];
+    enterSlide(s, o);
+    for (let i = 0; i < 10; i++) step(s, o, { slip: 20 });
+    for (let i = 0; i < 3; i++) { step(s, o, { steer: -0.3, slip: 14 }); out.push(`${o.event}|${s.phase}`); }
+    for (let i = 0; i < 20; i++) step(s, o, { steer: 0.6, slip: 18 });
+    step(s, o, { steer: -0.8, slip: 4, speed: 62 });
+    out.push(`${o.event}|${o.quality.toFixed(4)}|${o.grade}`);
+    return out.join(';');
+  }
+  const one = script();
+  ok(one === script(), 'correction-then-exit script replays identically');
+  ok(one.includes('exit|') && one.includes('perfect'), 'script covers held slide plus rewarded exit', one.slice(-32));
+}
+
+// 34. Off-road (dirt) earns nothing: no entry, no graded exit, and any stored
+// boost is canceled. Handbrake edges are still tracked for clean road re-entry.
+{
+  const s = createDriftState(), o = createDriftOut();
+  // Charge a full slide on the road first, then step onto the dirt.
+  enterSlide(s, o);
+  for (let i = 0; i < 12; i++) step(s, o, { slip: 20 });
+  step(s, o, { steer: -0.8, slip: 4, speed: 62 }); // clean exit -> boost
+  ok(o.event === 'exit' && s.boostT > 0, 'road exit boosts before the dirt', `boostT=${s.boostT.toFixed(2)}`);
+  step(s, o, { onRoad: false, steer: 0.6, hand: true, slip: 30, speed: 90 });
+  ok(s.boostT === 0 && s.boostAccel === 0 && s.phase === 'idle', 'dirt cancels the stored boost and aborts the slide', `boostT=${s.boostT} phase=${s.phase}`);
+  // Repeated dirt taps + countersteers never enter or grade an exit.
+  let entered = 0, exits = 0, graded = 0;
+  for (let cycle = 0; cycle < 4; cycle++) {
+    const dir = cycle % 2 === 0 ? 1 : -1;
+    for (let k = 0; k < 6; k++) { step(s, o, { onRoad: false, steer: dir, hand: true, slip: 26, speed: 90 }); if (o.event === 'entered') entered++; }
+    for (let k = 0; k < 10; k++) { step(s, o, { onRoad: false, steer: -dir, hand: false, slip: 4, speed: 90 }); if (o.event === 'exit') { exits++; if (o.quality > 0) graded++; } }
+  }
+  ok(entered === 0 && exits === 0 && graded === 0, 'dirt never enters or grades a rhythm exit', `entered=${entered} exits=${exits} graded=${graded}`);
+  ok(s.phase === 'idle', 'dirt leaves the machine idle');
+  // Returning to asphalt cannot cash a dirt charge: a countersteer with no
+  // fresh road entry stays idle and emits nothing.
+  for (let k = 0; k < 20; k++) step(s, o, { onRoad: true, steer: -0.8, hand: false, slip: 4, speed: 90 });
+  ok(o.event !== 'exit' && s.boostT === 0, 'returning to road cannot cash a dirt charge', `event=${o.event} boostT=${s.boostT}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

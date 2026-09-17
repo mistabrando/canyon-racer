@@ -24,11 +24,20 @@
     "tests/drift-control.ts",
     "tests/track-variance.ts",
     "src/loop.ts",
+    "src/retry-control.ts",
     "tests/loop-ui.ts",
+    "tests/retry-restart.ts",
     "tests/trails-bounds.ts",
     "src/barrier-plan.ts",
     "tests/barrier-plan.ts",
     "tests/barrier-edge.ts",
-    "tests/corner-apex.ts"
+    "tests/corner-apex.ts",
+    "src/audio.ts",
+    "src/driving-feedback.ts",
+    "tests/audio.ts",
+    "tests/driving-feedback.ts",
+    "src/course-reference.ts",
+    "src/courses.ts",
+    "tests/courses.ts"
   ]
 }

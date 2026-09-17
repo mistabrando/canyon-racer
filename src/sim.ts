@@ -9,15 +9,20 @@ export const GRAV = 26;
 export const LAUNCH_FOLLOW = 11; // v^2 * convex-curvature threshold for leaving the road
 export const LAUNCH_MIN_SPEED = 20;
 export const LAUNCH_VY_MIN = 5.5; // guarantees clearly visible airtime (>= ~0.42s)
-export const LAUNCH_VY_MAX = 13;
+export const LAUNCH_VY_MAX = 6.5; // caps airtime at ~0.5s so flight stays ~70u
 export const FINISH_ARM_MS = 5000;
 export const STICK_RANGE_PX = 48;
 export const START_SPEED = 10;
-export const ACCEL_ROAD = 75;
-export const ACCEL_OFFROAD = 14;
-export const MAX_GRIP_SPEED = 80;
-export const MAX_DRIFT_SPEED = 74;
-export const MAX_OFFROAD_SPEED = 26;
+// Trackmania pass: the road is very fast (cruise ~140), a committed drift
+// is distinctly slower but fluent (~112), and a timed clean exit surges to
+// ~162 before settling back to cruise. Grip-only cannot hold the ordinary
+// drift corners at cruise, so corners demand a real slide.
+export const ACCEL_ROAD = 140;
+export const ACCEL_OFFROAD = 16; // dirt: reduced forward traction, still recoverable
+export const MAX_GRIP_SPEED = 140;
+export const MAX_DRIFT_SPEED = 112;
+export const MAX_OFFROAD_SPEED = 44; // dirt plain is slow; momentum still carries
+export const DIRT_LATERAL_GRIP = 4.0; // dirt: low lateral traction; slidey but steerable
 export const DRIFT_MIN_SPEED = 25;
 export const DRIFT_MIN_STEER = 0.18;
 export const STEER_RISE = 6;
@@ -48,7 +53,7 @@ export const SCRUB_COUNTER_RELIEF = 0.5;
 export const EXIT_BOOST_ACCEL = 32;
 export const EXIT_BOOST_TIME = 0.7;
 export const EXIT_SLIP_MAX = 0.35;
-export const OFFROAD_DRAG = 0.55;
+export const OFFROAD_DRAG = 0.5; // dirt bleeds speed; momentum still carries for a while
 export const DRIFT_DRAG = 0.35;
 export const SCRUB_GAIN = 9.0;
 export const SCRUB_MIN_SLIP = 0.61;
@@ -79,6 +84,8 @@ export function wallLimit(halfW: number): number {
 export const WALL_GLANCE_VN = 6;
 export const WALL_GLANCE_GAIN = 0.02;
 export const WALL_GLANCE_MAX = 0.15;
+export const WALL_IMPACT_BLEND_VN = 6;
+export const WALL_IMPACT_MIN_UPSET = 0.25;
 export const WALL_IMPACT_COOLDOWN = 0.35;
 export const WALL_RESTITUTION = 0.5;
 export const CRASH_UPSET_TIME = 0.6;
@@ -90,22 +97,38 @@ export const BREAK_SLIP = 0.18;
 export const BREAK_ATTACK = 2.2;
 export const WOBBLE_GAIN = 0.9;
 export const STUCK_SPD = 5;
-export const SNAP_MIN_SPD = 8; // slower: stall/crawl must not poison the respawn snapshot
-export const SNAP_MAX_SLIP = 0.6; // more sideways (~34deg): spin must not poison the snapshot
+export const SNAP_MIN_SPD = 25; // crawls and scrub-locked spins (which equilibrate well under this at cruise 140) must not poison the respawn snapshot
+export const SNAP_MAX_SLIP = 0.35; // ~20deg: restoring into a bigger slide at cruise 140 is unrecoverable, so only near-settled moments anchor
+// Safe-rescue validation (September 15 opening rail): a recovery anchor must
+// sit clear of the rails, point roughly along the road, not drift outward into
+// imminent contact, and hold no active scrape/crash. The old gate accepted
+// offroad near-rail poses angled at the guardrail, so R restored the same
+// near-impact pose. A short bounded history backs repeat rescues off the newest
+// anchor when no fresh clean moment has been recorded.
+export const SNAP_RAIL_CLEAR = 1.0; // min clearance from the road edge to the anchor
+export const SNAP_MAX_HEAD_ERR = 0.4; // max |heading - road yaw| (rad, ~23deg)
+export const SNAP_MAX_OUT_V = 2.0; // max outward (toward nearest rail) lateral velocity
+export const SNAP_MIN_AHEAD = 4; // samples of road that must remain ahead of the anchor
+export const SNAP_HISTORY = 6; // bounded count of live recovery candidates
+// A rescue must not re-arm candidates by immediately re-recording the pose it
+// just restored (that would reset the repeat-rescue backoff and loop). After a
+// rescue, the car must drive this many course samples forward before a new
+// clean moment is accepted as an anchor.
+export const SNAP_RESUME_AHEAD = 4;
 export const FINISH_TAIL = 60;
-// Open-edge contract (Cycle 7): only VISIBLE rails collide (see tr.barrier).
-// Road + SHOULDER past the edge is supported runoff (snaps to road height
-// with offroad drag); beyond that the car departs into real ballistic fall
-// instead of snapping. OOB fires after a short sustained interval so the
-// main loop can show R RESET; respawn itself stays manual and deterministic.
-export const EDGE_SHOULDER = 3.5;
-export const BACKSTOP_RADIUS = 40;
-export const OOB_EXTRA_LAT = 15;
-export const OOB_FALL_DEPTH = 10;
+// Off-course contract (speed-dirt pass): the out-of-bounds area is a wide,
+// drivable dirt plain (see ./surface.ts), not a void. Ground exists everywhere,
+// so there is no bottomless fall and no invisible backstop wall; OOB only arms
+// R RESET once the car has wandered far out onto the plain, and it can always
+// drive back. Respawn stays the only teleport (deterministic snapshot + 3s gap).
+export const OOB_EXTRA_LAT = 45; // beyond halfW: how far out OOB arms R RESET
 export const OOB_ARM_MS = 900;
+export const OOB_DECAY = 2;
+export const BACKSTOP_RADIUS = 40;
 
 import { barrierAt } from './barrier-plan.js';
 import type { BarrierPlan } from './barrier-plan.js';
+import { groundSurfaceY } from './surface.js';
 
 export const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 export const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -232,6 +255,7 @@ export interface SimState {
   approach: number[];
   rec: GhostRec; recLastMs: number;
   snap: Snap; snapTimer: number;
+  snaps: Snap[]; rescueStreak: number; rescueIdx: number;
   steer: number; driftAmt: number; wasOffroad: boolean; scrapeLowMs: number; breakT: number; wallCool: number; crashT: number; crashAmp: number; scrapeT: number; kickT: number; oobMs: number;
   driftHold: number; exitT: number;
   rhythm: DriftState; rhythmOut: DriftStepOut; rhythmExitLatch: number;
@@ -247,6 +271,7 @@ export function createSimState(): SimState {
     approach: [],
     rec: { t: 0, p: [], ts: [] }, recLastMs: 0,
     snap: { i: 0, x: 0, y: 0, z: 0, h: 0, vx: 0, vz: 0 }, snapTimer: 0,
+    snaps: [], rescueStreak: 0, rescueIdx: -1,
     steer: 0, driftAmt: 0, wasOffroad: false, scrapeLowMs: 0, breakT: 0, wallCool: 0, crashT: 0, crashAmp: 0, scrapeT: 0, kickT: 0, oobMs: 0,
     driftHold: 0, exitT: 0,
     rhythm: createDriftState(), rhythmOut: createDriftOut(), rhythmExitLatch: 0,
@@ -314,6 +339,9 @@ export function resetRun(s: SimState, tr: TrackView, i0: number) {
   s.rec = { t: 0, p: [[s.px, s.py, s.pz, s.heading]], ts: [0] };
   s.recLastMs = 0;
   s.snap = { i: i0, x: s.px, y: s.py, z: s.pz, h: s.heading, vx: s.vx, vz: s.vz };
+  s.snaps = [s.snap];
+  s.rescueStreak = 0;
+  s.rescueIdx = -1;
   s.snapTimer = 0;
   s.scrapeLowMs = 0;
   s.breakT = 0;
@@ -330,9 +358,24 @@ export function resetRun(s: SimState, tr: TrackView, i0: number) {
 // Respawn from snapshot with a real 3s timing gap (visible in ghost timestamps).
 export function simRespawn(s: SimState) {
   if (s.finished) return;
-  s.lastIdx = s.snap.i;
-  s.px = s.snap.x; s.py = s.snap.y; s.pz = s.snap.z;
-  s.heading = s.snap.h; s.vx = s.snap.vx; s.vz = s.snap.vz; s.vy = 0; s.grounded = true;
+  // Safe-rescue selection: prefer the newest validated anchor, but back off the
+  // bounded history on repeated rescues with no fresh clean moment in between,
+  // so R can never loop the player back onto the same bad snapshot. Index 0 is
+  // the pinned run-start anchor (never shifted out), so a fallback always
+  // exists. When backing off, drop the higher-progress entries that are now
+  // future/invalid so a later rescue can never jump forward into pre-rollback
+  // history (no shortcut progress).
+  const n = s.snaps.length;
+  const back = n > 1 ? Math.min(s.rescueStreak, n - 1) : 0;
+  const pick = n - 1 - back;
+  const anchor = n > 0 ? s.snaps[pick] : s.snap;
+  if (n > 0 && pick < n - 1) {
+    s.snaps.length = pick + 1;
+    s.snap = anchor;
+  }
+  s.lastIdx = anchor.i;
+  s.px = anchor.x; s.py = anchor.y; s.pz = anchor.z;
+  s.heading = anchor.h; s.vx = anchor.vx; s.vz = anchor.vz; s.vy = 0; s.grounded = true;
   s.driftAmt = 0; s.wasOffroad = false;
   s.justLaunched = false;
   s.scrapeLowMs = 0;
@@ -343,11 +386,26 @@ export function simRespawn(s: SimState) {
   resetDrift(s.rhythm); s.rhythmOut = createDriftOut(); s.rhythmExitLatch = 0;
   s.oobMs = 0;
   s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading; s.pitch0 = s.pitch;
+  s.rescueIdx = anchor.i;
+  s.rescueStreak++;
   s.raceMs += RESPAWN_PENALTY_MS;
 }
 
 const LOOK = 8;
 const APPROACH_N = 12;
+
+// Dirt cancels all drift rewards: the slingshot charge, the legacy exit-grip
+// boost, and the exit latch. Called when the car is off the asphalt (including
+// a step that crosses the edge) so a dirt-earned (or dirt-carried) charge can
+// never be cashed back on the road.
+function clearDirtReward(s: SimState): void {
+  s.exitT = 0;
+  s.rhythm.boostT = 0;
+  s.rhythm.boostAccel = 0;
+  s.rhythmExitLatch = 0;
+  s.rhythmOut.boostAccel = 0;
+  if (s.rhythmOut.event === 'exit') { s.rhythmOut.event = 'none'; s.rhythmOut.quality = 0; s.rhythmOut.grade = 'none'; }
+}
 
 export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number): StepInfo {
   const noop: StepInfo = {
@@ -363,6 +421,17 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading; s.pitch0 = s.pitch;
   s.prevRaceMs = s.raceMs;
   let rhythmBoost = 0; // one-shot rhythm slingshot accel (gates legacy exit boost)
+
+  // Surface at the start of the step, plus a one-step projection, so a car that
+  // leaves the asphalt within THIS step is treated as off-road for rewards.
+  // Uses the previous tracked sample (the step's own trackFollow runs later).
+  const iOn = s.lastIdx;
+  const latOn = (s.px - tr.x[iOn]) * tr.nx[iOn] + (s.pz - tr.z[iOn]) * tr.nz[iOn];
+  const latOnNext = latOn + (s.vx * tr.nx[iOn] + s.vz * tr.nz[iOn]) * dt;
+  const onRoad = Math.abs(latOn) <= tr.halfW && Math.abs(latOnNext) <= tr.halfW;
+  // Leaving (or already off) the asphalt cancels drift rewards before they can
+  // be spent this step.
+  if (!onRoad) clearDirtReward(s);
 
   const steer = clamp(inp.steer, -1, 1);
   // Deterministic steering smoothing: quick rise to full lock, quicker recenter.
@@ -396,7 +465,7 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   // all physics (caps, forces, velocity changes) stays here.
   updateDrift(s.rhythm, DEFAULT_DRIFT_TUNING, {
     dt, steer: steerEff, handbrake: inp.drift, speed: spdNow,
-    slipDeg: slipRel * 180 / Math.PI, grounded: s.grounded,
+    slipDeg: slipRel * 180 / Math.PI, grounded: s.grounded, onRoad,
   }, s.rhythmOut);
   if (s.rhythmOut.event === 'exit') s.rhythmExitLatch = 1.0;
   else if (s.rhythmExitLatch > 0) s.rhythmExitLatch = Math.max(0, s.rhythmExitLatch - dt);
@@ -420,7 +489,7 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     s.driftAmt = Math.max(0, s.driftAmt - lerp(DRIFT_RELEASE, DRIFT_RECOVER_FAST, recoverMix) * dt);
     // Clean-exit reward: a real drift unwound with the slide settled earns a
     // brief exit-grip boost, so deliberate drift timing beats holding the slide.
-    if (prevAmt > 0.4 && s.driftAmt <= 0.4 && s.grounded
+    if (prevAmt > 0.4 && s.driftAmt <= 0.4 && s.grounded && onRoad
       && Math.abs(slipRel) < EXIT_SLIP_MAX && s.driftHold > 0.25 && s.rhythmExitLatch <= 0) {
       s.exitT = EXIT_BOOST_TIME;
     }
@@ -439,7 +508,6 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   const relX = s.px - tr.x[i], relZ = s.pz - tr.z[i];
   const lat = relX * tr.nx[i] + relZ * tr.nz[i];
   const offroad = Math.abs(lat) > tr.halfW;
-  const groundY = tr.y[i] + 0.2;
 
   let spd = Math.hypot(s.vx, s.vz);
   const drifting = s.driftAmt > 0.4;
@@ -449,8 +517,14 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     // At top speed the car cannot rotate enough on grip alone — hairpins demand drift.
     // Full-lock grip yaw at 80 units/s is ~0.61 rad/s (radius ~131): fast sweepers only.
     const gripRamp = Math.min(Math.max(spd, 8) / 10, 1); // floor: pinned car can still rotate to escape
-    const highCut = spd <= 30 ? 1 : Math.max(0.24, 1 - (spd - 30) / 68);
-    const yawRate = lerp(2.3 * highCut, 1.5, s.driftAmt) * gripRamp;
+    // Grip radius at cruise is ~160u, so the ordinary 110-130u drift corners
+    // cannot be held on grip alone; the 130-175u sweepers can. Drift yaw is
+    // stronger so the slide is decisive and countersteer reads clearly.
+    // The floor ramps 0.30 -> 0.38 between 100 and 140 u/s: below 100 the
+    // pre-Trackmania grip curve is untouched, at the 140 cruise the floor
+    // holds radius ~160 (140 / (2.3 * 0.38)).
+    const highCut = spd <= 30 ? 1 : Math.max(0.30 + 0.08 * clamp((spd - 100) / 40, 0, 1), 1 - (spd - 30) / 95);
+    const yawRate = lerp(2.3 * highCut, 1.9, s.driftAmt) * gripRamp;
     s.heading -= steerEff * yawRate * dt;
     // Wall zone is the contact band just outside the road edge (the car
     // rests at halfW+0.225 while scraping), so kick/pendulum energy never
@@ -483,7 +557,9 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     // previously read after, so the slingshot accel fought the drift cap and
     // the surge never materialized.)
     rhythmBoost = s.rhythm.boostT > 0 ? s.rhythm.boostAccel : 0;
-    const maxSp = rhythmBoost > 0 ? BOOST_SPEED_CAP : offroad ? MAX_OFFROAD_SPEED : drifting ? MAX_DRIFT_SPEED : MAX_GRIP_SPEED;
+    const maxSp = offroad ? MAX_OFFROAD_SPEED
+      : rhythmBoost > 0 ? BOOST_SPEED_CAP
+      : drifting ? MAX_DRIFT_SPEED : MAX_GRIP_SPEED;
     // Crash upset: a wall impact stuns forward drive briefly, scaled by the
     // stored impact severity. High-speed wall hits cost recovery time on top
     // of the instant loss, so wall-leaning lines lose more than clean ones.
@@ -504,7 +580,10 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     const nearWall = Math.abs(lat) > tr.halfW + 1.0;
     const loosen = !nearWall && s.driftAmt > 0.5
       ? Math.min(Math.max(s.driftHold - DRIFT_FATIGUE_GRACE, 0) * REAR_LOOSEN_GAIN, REAR_LOOSEN_MAX) : 0;
-    const grip = (lerp(offroad ? 5.5 : 9.0, 4.8, s.driftAmt)
+    // Dirt has very low lateral traction: the slide persists and recovery is
+    // slow (momentum/slip carry), with no countersteer or loosen assist.
+    const gripBase = offroad ? DIRT_LATERAL_GRIP : lerp(9.0, 4.8, s.driftAmt);
+    const grip = (gripBase
       + (offroad || nearWall ? 0 : (COUNTER_GRIP_BOOST * oppose - loosen) * s.driftAmt))
       * (s.kickT > 0 && !nearWall ? KICK_GRIP_KEEP : 1);
     lSpeed *= Math.exp(-grip * dt);
@@ -537,10 +616,12 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     }
     spd = Math.hypot(s.vx, s.vz);
     // Crest launch: vertical launch velocity derived from approach pitch.
+    // Only on the road — a car on the flat dirt must never launch off the
+    // nearest road sample's curvature.
     s.approach.push(gradeHere);
     if (s.approach.length > APPROACH_N) s.approach.shift();
     const vH = Math.hypot(s.vx, s.vz);
-    if (vH > LAUNCH_MIN_SPEED && -kappaV * vH * vH > LAUNCH_FOLLOW) {
+    if (!offroad && vH > LAUNCH_MIN_SPEED && -kappaV * vH * vH > LAUNCH_FOLLOW) {
       let ap = 0.08;
       for (const g of s.approach) if (g > ap) ap = g;
       s.vy = clamp(vH * ap, LAUNCH_VY_MIN, LAUNCH_VY_MAX);
@@ -555,26 +636,24 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   }
 
   s.px += s.vx * dt; s.pz += s.vz * dt;
-  // Supported road + shoulder snaps to the sampled road height; past the
-  // shoulder on an open edge the car departs into real ballistic fall.
+  // Ground exists everywhere: the road, the dirt verge, and the endless dirt
+  // plain (see ./surface.ts). The car always has a surface under it — no void,
+  // no bottomless fall, no invisible backstop wall. Only a road crest launches
+  // it into real airtime, and it lands back on whatever surface is below.
   const latN = (s.px - tr.x[i]) * tr.nx[i] + (s.pz - tr.z[i]) * tr.nz[i];
-  const supported = Math.abs(latN) <= tr.halfW + EDGE_SHOULDER;
+  const groundY = groundSurfaceY(tr.y[i], latN, tr.halfW) + 0.2;
+  // A step that ends off the asphalt also drops any drift reward (covers an
+  // edge crossing the start-of-step projection missed).
+  if (Math.abs(latN) > tr.halfW) clearDirtReward(s);
   if (s.grounded) {
-    if (supported) {
-      s.py = groundY;
-      s.pitch = Math.atan(clamp(gradeHere, -0.5, 0.5));
-    } else {
-      s.grounded = false; s.vy = 0; s.airSteps = 0; s.justLaunched = false;
-      s.pitch = clamp(Math.atan2(s.vy, Math.max(Math.hypot(s.vx, s.vz), 1)), -0.6, 0.6);
-    }
+    s.py = groundY;
+    s.pitch = Math.atan(clamp(gradeHere, -0.5, 0.5));
   } else {
     s.py += s.vy * dt;
     s.airSteps++;
-    // Land only while descending through the current road surface —
-    // never on the launch step (justLaunched), never while rising, and
-    // never off the supported road/shoulder (no floor: falling off an
-    // open edge keeps falling until the driver resets).
-    if (supported && !s.justLaunched && s.vy <= 0 && s.py <= groundY) {
+    // Land while descending through the surface; the plain means a landing is
+    // always available, but the launch step itself never lands.
+    if (!s.justLaunched && s.vy <= 0 && s.py <= groundY) {
       landV = s.vy;
       s.py = groundY; s.grounded = true; s.vy = 0; landed = true;
       // Touchdown bleeds the frozen in-air slide at the module's own release
@@ -604,9 +683,12 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   // wallNx/wallNz report the inward (road-pointing)
   // contact normal while touching. Contact deflects the slide along the wall.
   // Glancing touches scrub a little speed and scrape. Harder hits spend one
-  // clean impact event (45-65% tangential loss + a gentle separation nudge)
-  // followed by a short cooldown where further contact only slides: no
-  // per-tick bounce stutter, no teleport, no impact spam. Steering away vents
+  // clean impact event (severity-ramped tangential loss + a gentle separation
+  // nudge) followed by a short cooldown where further contact only slides: no
+  // per-tick bounce stutter, no teleport, no impact spam. Just above the
+  // glance threshold the loss blends up from the glance level and the crash
+  // upset is shortened; full loss and full upset apply past the blend band,
+  // so hard crashes cost exactly as before. Steering away vents
   // scrape drag for quick recovery; leaning in stays slow.
   const LIM = wallLimit(tr.halfW);
   s.wallCool = Math.max(0, s.wallCool - dt);
@@ -648,7 +730,17 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
       if (effVn > WALL_GLANCE_VN && s.wallCool <= 0 && (freshTouch || vn > 2 * WALL_GLANCE_VN)) {
         // One clean impact event per fresh touch (a harder lean-in past
         // twice the glance band may escalate mid-scrape), then cooldown.
-        const loss = clamp(WALL_HIT_MIN_LOSS + effVn * WALL_HIT_VN_GAIN, 0, WALL_HIT_MAX_LOSS);
+        // Severity continuity: just above the glance threshold the loss
+        // blends up from the glance level and the crash upset is shortened,
+        // so a touch barely harder than a glance costs barely more. Past the
+        // blend band the full formula and full upset apply unchanged, so
+        // medium and hard crashes keep their exact historical cost. Rebound,
+        // cooldown, severity and the one-event contract are untouched.
+        const fullLoss = clamp(WALL_HIT_MIN_LOSS + effVn * WALL_HIT_VN_GAIN, 0, WALL_HIT_MAX_LOSS);
+        const blendT = clamp((effVn - WALL_GLANCE_VN) / WALL_IMPACT_BLEND_VN, 0, 1);
+        const blendS = blendT * blendT * (3 - 2 * blendT);
+        const glanceLoss = clamp(WALL_GLANCE_VN * WALL_GLANCE_GAIN, 0, WALL_GLANCE_MAX);
+        const loss = lerp(glanceLoss, fullLoss, blendS);
         s.vx *= (1 - loss); s.vz *= (1 - loss);
         s.vx -= tr.nx[j] * sg * effVn * WALL_RESTITUTION;
         s.vz -= tr.nz[j] * sg * effVn * WALL_RESTITUTION;
@@ -656,7 +748,7 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
         impact = wallSev;
         wallHit = true;
         s.wallCool = WALL_IMPACT_COOLDOWN;
-        s.crashT = CRASH_UPSET_TIME;
+        s.crashT = CRASH_UPSET_TIME * (WALL_IMPACT_MIN_UPSET + (1 - WALL_IMPACT_MIN_UPSET) * blendS);
         s.crashAmp = sg * CRASH_WOBBLE * wallSev;
       } else if (vn <= WALL_GLANCE_VN && freshTouch) {
         // Glancing touch: light proportional scrub once per touch, no bounce,
@@ -686,15 +778,13 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   } else {
     s.scrapeT = 0;
   }
-  // Out-of-bounds: far laterally off course, or fallen well below the road
-  // after an open-edge departure. Sustained ~0.9s before the UI offers R
-  // RESET; driving back in range decays it. Manual respawn stays the only
-  // teleport (deterministic snapshot + 3s ghost gap, untouched).
+  // Out-of-bounds: the plain is drivable, so OOB only arms R RESET once the
+  // car has wandered far out laterally, and decays when it comes back. There
+  // is no depth test: ground exists everywhere, so nothing falls into a void.
   {
     const latJ = (s.px - tr.x[j]) * tr.nx[j] + (s.pz - tr.z[j]) * tr.nz[j];
-    const deep = tr.y[j] + 0.2 - s.py > OOB_FALL_DEPTH;
-    if (Math.abs(latJ) > tr.halfW + OOB_EXTRA_LAT || deep) s.oobMs += dt * 1000;
-    else s.oobMs = Math.max(0, s.oobMs - 2 * dt * 1000);
+    if (Math.abs(latJ) > tr.halfW + OOB_EXTRA_LAT) s.oobMs += dt * 1000;
+    else s.oobMs = Math.max(0, s.oobMs - OOB_DECAY * dt * 1000);
   }
   // start backstop: don't drive off behind the start line. Gated on
   // proximity to the start sample: a half-plane test alone misfires on
@@ -716,22 +806,49 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   // poison the snapshot: refresh only while moving with the car roughly
   // aligned, so R always rescues to a drivable moment instead of restoring
   // the same stall forever. Timer keeps running while gated out, so the next
-  // healthy moment snapshots immediately.
+  // healthy moment snapshots immediately. Safety gate: the anchor must also
+  // sit clear of the rails, point roughly along the road (not outward into the
+  // guardrail), carry no outward drift and no active scrape/crash, and have
+  // road ahead to regain control. The old gate accepted offroad near-rail
+  // poses angled at the opening guardrail, so R restored a near-impact pose.
   s.snapTimer += dt;
   const snapSpd = Math.hypot(s.vx, s.vz);
   const snapHx = Math.sin(s.heading), snapHz = Math.cos(s.heading);
   const snapSlip = Math.abs(Math.atan2(s.vx * snapHz - s.vz * snapHx, Math.abs(s.vx * snapHx + s.vz * snapHz) + 1e-6));
-  if (s.snapTimer > 0.75 && s.grounded && Math.abs(lat) <= tr.halfW + 0.5 && snapSpd >= SNAP_MIN_SPD && snapSlip <= SNAP_MAX_SLIP) {
+  const snapLat = (s.px - tr.x[sIdx]) * tr.nx[sIdx] + (s.pz - tr.z[sIdx]) * tr.nz[sIdx];
+  const snapSide = snapLat >= 0 ? 1 : -1;
+  const snapOutV = (s.vx * tr.nx[sIdx] + s.vz * tr.nz[sIdx]) * snapSide;
+  const snapHeadErr = Math.abs(wrapPi(s.heading - tr.yaw[sIdx]));
+  const snapSafe = s.grounded
+    && tr.halfW - Math.abs(snapLat) >= SNAP_RAIL_CLEAR
+    && snapSpd >= SNAP_MIN_SPD
+    && snapSlip <= SNAP_MAX_SLIP
+    && snapHeadErr <= SNAP_MAX_HEAD_ERR
+    && snapOutV <= SNAP_MAX_OUT_V
+    && s.scrapeT <= 0 && s.crashT <= 0
+    && sIdx <= tr.n - 1 - SNAP_MIN_AHEAD;
+  if (s.snapTimer > 0.75 && snapSafe && (s.rescueStreak <= 0 || sIdx >= s.rescueIdx + SNAP_RESUME_AHEAD)) {
     s.snapTimer = 0;
-    s.snap = { i: sIdx, x: s.px, y: s.py, z: s.pz, h: s.heading, vx: s.vx, vz: s.vz };
+    const cand = { i: sIdx, x: s.px, y: s.py, z: s.pz, h: s.heading, vx: s.vx, vz: s.vz };
+    s.snap = cand;
+    s.snaps.push(cand);
+    // Keep the pinned run-start anchor at index 0 and bound the live candidate
+    // tail, so a rescue always has a base anchor without unbounded growth.
+    while (s.snaps.length > SNAP_HISTORY + 1) s.snaps.splice(1, 1);
+    s.rescueStreak = 0;
   }
 
-  // exact finish crossing (plane through final sample, normal = final tangent)
+  // exact finish crossing (plane through final sample, normal = final tangent).
+  // On-road only: dirt beside the finish straight cannot cross the plane for a
+  // time (the shortcut/motion gates already block cuts; this closes the
+  // parallel-plain case).
   let finished = false;
   {
     const e = tr.n - 1;
+    const latFin = (s.px - tr.x[j]) * tr.nx[j] + (s.pz - tr.z[j]) * tr.nz[j];
+    const onRoadFin = Math.abs(latFin) <= tr.halfW;
     const curD = (s.px - tr.x[e]) * tr.tx[e] + (s.pz - tr.z[e]) * tr.tz[e];
-    if (s.prevFinD <= 0 && curD > 0 && s.prevRaceMs + dt * 1000 > FINISH_ARM_MS && s.lastIdx >= tr.n - FINISH_TAIL) {
+    if (onRoadFin && s.prevFinD <= 0 && curD > 0 && s.prevRaceMs + dt * 1000 > FINISH_ARM_MS && s.lastIdx >= tr.n - FINISH_TAIL) {
       const f = clamp(-s.prevFinD / (curD - s.prevFinD || 1e-9), 0, 1);
       s.raceMs = s.prevRaceMs + f * dt * 1000;
       s.px = s.px0 + (s.px - s.px0) * f;

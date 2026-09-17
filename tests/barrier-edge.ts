@@ -1,13 +1,15 @@
-// barrier-edge.ts — Cycle 7 end-to-end: explicit barrier contract.
-// Guarded edges rebound (visible rail spans collide); open edges allow real
-// flight/fall (no clamp, no wallHit, no road-height snap); OOB arms R RESET;
-// respawn/ghosts/finish/cut contracts hold. Deterministic, plain node.
+// barrier-edge.ts — end-to-end: explicit barrier contract + the dirt plain.
+// Guarded edges rebound (visible rail spans collide); open edges no longer fall
+// into a void — the car is carried onto a wide, drivable dirt verge/plain
+// (./surface.ts) and always has supported ground. OOB only arms R RESET far out
+// on the plain. Respawn/ghosts/finish/cut contracts hold. Deterministic, node.
 declare const process: { exit(c: number): void };
 import {
   createSimState, resetRun, simRespawn, simStep, trackFromPoints, wallLimit,
-  BACKSTOP_RADIUS, EDGE_SHOULDER, OOB_ARM_MS, RESPAWN_PENALTY_MS,
+  BACKSTOP_RADIUS, OOB_ARM_MS, OOB_EXTRA_LAT, RESPAWN_PENALTY_MS,
 } from '../src/sim.js';
 import type { SimState, StepInput, TrackView } from '../src/sim.js';
+import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.js';
 import { barrierAt, planBarriers } from '../src/barrier-plan.js';
 import type { BarrierPlan } from '../src/barrier-plan.js';
 import { planGuardrails, resolveOptions } from '../src/visuals.js';
@@ -22,7 +24,7 @@ const DT = 1 / 60;
 const drive: StepInput = { steer: 0, drift: false };
 const HALF = 8;
 const LIM = wallLimit(HALF); // 8.225
-const SUPPORT = HALF + EDGE_SHOULDER; // 11.5
+const PLAIN_LAT = HALF + DIRT_VERGE_WIDTH + 30; // clearly out on the plain
 
 function straight(len = 1200): TrackView {
   const pts: { x: number; y: number; z: number }[] = [];
@@ -35,19 +37,22 @@ function placeOut(s: SimState, tr: TrackView, z: number, lat: number, vLat: numb
   s.lastIdx = i;
   s.px = tr.x[i] + tr.nx[i] * lat;
   s.pz = tr.z[i] + tr.nz[i] * lat;
-  s.py = tr.y[i] + 0.2;
+  s.py = groundSurfaceY(tr.y[i], lat, tr.halfW) + 0.2;
   s.vx = tr.nx[i] * vLat + tr.tx[i] * vFwd;
   s.vz = tr.nz[i] * vLat + tr.tz[i] * vFwd;
   s.heading = Math.atan2(s.vx, s.vz); // drive outward, no slide-scrub
   s.vy = 0; s.grounded = true;
   s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading;
 }
-
+function latOf(s: SimState, tr: TrackView): number {
+  const j = s.lastIdx;
+  return (s.px - tr.x[j]) * tr.nx[j] + (s.pz - tr.z[j]) * tr.nz[j];
+}
 function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLat: number, vFwd = 40): void {
   s.lastIdx = idx;
   s.px = tr.x[idx] + tr.nx[idx] * lat;
   s.pz = tr.z[idx] + tr.nz[idx] * lat;
-  s.py = tr.y[idx] + 0.2;
+  s.py = groundSurfaceY(tr.y[idx], lat, tr.halfW) + 0.2;
   s.vx = tr.nx[idx] * vLat + tr.tx[idx] * vFwd;
   s.vz = tr.nz[idx] * vLat + tr.tz[idx] * vFwd;
   s.heading = Math.atan2(s.vx, s.vz);
@@ -66,16 +71,14 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   const info = simStep(s, tr, drive, DT);
   ok(info.wallHit === true, 'guarded edge fires wallHit');
   ok((info.wallSev ?? 0) > 0, 'guarded edge severity tagged', `sev=${info.wallSev}`);
-  const lat = (s.px - tr.x[s.lastIdx]) * tr.nx[s.lastIdx] + (s.pz - tr.z[s.lastIdx]) * tr.nz[s.lastIdx];
+  const lat = latOf(s, tr);
   ok(Math.abs(lat) <= LIM + 1e-9, 'guarded edge clamps to rail', `lat=${lat.toFixed(3)}`);
   const after = Math.hypot(s.vx, s.vz);
   const loss = 1 - after / before;
   ok(loss >= 0.35 && loss <= 0.65, 'guarded impact costs speed', `loss=${(loss * 100).toFixed(1)}%`);
-  // Rebound: lateral velocity now points back toward the road.
   const outV = s.vx * tr.nx[s.lastIdx] + s.vz * tr.nz[s.lastIdx];
   ok(outV < 0, 'guarded edge rebounds inward', `outV=${outV.toFixed(2)}`);
   ok(info.wallHit !== undefined && info.oobMs === 0, 'no OOB on clean rail hit');
-  // Exit acceleration resumes once the driver steers off the rail.
   const f0 = info.fSpeed;
   let f1 = f0;
   for (let k = 0; k < 60; k++) f1 = simStep(s, tr, { steer: -1, drift: false }, DT).fSpeed;
@@ -83,31 +86,32 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   console.log(`[measure] guarded entry loss=${(loss * 100).toFixed(1)}% exit ${f0.toFixed(1)} -> ${f1.toFixed(1)}u/s`);
 }
 
-// 2. Open edge: no clamp, no wallHit, real fall, OOB arms R RESET.
+// 2. Open edge: no clamp, no wallHit, carried onto the dirt plain (no void).
 {
   const tr = straight();
   tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] }; // loaded but empty: open everywhere
   const s = createSimState();
   resetRun(s, tr, 0);
   placeOut(s, tr, 200, LIM - 0.5, 30);
-  let hit = false, minLat = 0;
+  let hit = false, maxLat = 0, airSteps = 0;
   let info = simStep(s, tr, drive, DT);
-  for (let k = 0; k < 240 && !info.finished; k++) {
+  for (let k = 0; k < 300 && !info.finished; k++) {
     if (info.wallHit) hit = true;
-    const lat = (s.px - tr.x[s.lastIdx]) * tr.nx[s.lastIdx] + (s.pz - tr.z[s.lastIdx]) * tr.nz[s.lastIdx];
-    if (Math.abs(lat) > Math.abs(minLat)) minLat = lat;
-    if (info.oobMs > OOB_ARM_MS) break;
+    if (!s.grounded) airSteps++;
+    maxLat = Math.max(maxLat, Math.abs(latOf(s, tr)));
     info = simStep(s, tr, drive, DT);
   }
   ok(!hit, 'open edge never fires wallHit');
-  ok(Math.abs(minLat) > LIM + 2, 'open edge leaves the road (no clamp)', `lat=${minLat.toFixed(1)}`);
-  ok(!s.grounded, 'open edge departs into flight');
-  ok(s.vy < 0 && s.py < tr.y[s.lastIdx] + 0.2 - 1, 'open edge falls ballistically (no road snap)', `vy=${s.vy.toFixed(1)} dy=${(tr.y[s.lastIdx] + 0.2 - s.py).toFixed(1)}`);
-  ok(info.oobMs > OOB_ARM_MS, 'OOB arms after a short fall', `oobMs=${info.oobMs.toFixed(0)}`);
-  console.log(`[measure] open-edge fall depth=${(tr.y[s.lastIdx] + 0.2 - s.py).toFixed(1)}u oobMs=${info.oobMs.toFixed(0)}`);
+  ok(maxLat > LIM + 20, 'open edge leaves the road into the plain', `lat=${maxLat.toFixed(1)}`);
+  ok(s.grounded && airSteps === 0, 'dirt plain supports the car (no bottomless fall)', `air=${airSteps}`);
+  const lat = latOf(s, tr);
+  const surf = groundSurfaceY(tr.y[s.lastIdx], lat, tr.halfW);
+  ok(Math.abs(surf - DIRT_PLAIN_Y) < 1e-9, 'far off course rests on the flat plain', `surf=${surf}`);
+  ok(Math.abs(s.py - (surf + 0.2)) < 1e-6, 'car sits on the rendered surface', `py=${s.py.toFixed(2)}`);
+  console.log(`[measure] open-edge maxLat=${maxLat.toFixed(1)} grounded=${s.grounded} py=${s.py.toFixed(2)}`);
 }
 
-// 3. Both sides: guarded +1 collides, open -1 falls (then flipped).
+// 3. Both sides: guarded +1 collides, open -1 stays on the dirt (then flipped).
 {
   for (const flip of [false, true]) {
     const tr = straight();
@@ -115,25 +119,22 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
     tr.barrier = { spans: [{ aS: 100, bS: 300, side: guardedSide as 1 | -1 }], length: tr.cum[tr.cum.length - 1] };
     const s = createSimState();
     resetRun(s, tr, 0);
-    // Drive at the guarded side.
     placeOut(s, tr, 200, guardedSide * (LIM - 0.5), guardedSide * 25);
     let gHit = false;
     for (let k = 0; k < 8 && !gHit; k++) { if (simStep(s, tr, drive, DT).wallHit) gHit = true; }
     ok(gHit, `side ${guardedSide} guarded collides (flip=${flip})`);
-    // Drive at the open side.
     placeOut(s, tr, 200, -guardedSide * (LIM - 0.5), -guardedSide * 25);
     let hit = false;
     let info = simStep(s, tr, drive, DT);
     for (let k = 0; k < 120; k++) {
       if (info.wallHit) hit = true;
-      if (!s.grounded) break;
       info = simStep(s, tr, drive, DT);
     }
-    ok(!hit && !s.grounded, `side ${-guardedSide} open falls (flip=${flip})`);
+    ok(!hit && s.grounded, `side ${-guardedSide} open stays on dirt (flip=${flip})`);
   }
 }
 
-// 4. Curved track: outside of the hairpin guards, inside is open.
+// 4. Curved track: outside of the hairpin guards, inside is open dirt.
 {
   const pts: { x: number; y: number; z: number }[] = [];
   let x = 0, z = 0, hd = 0;
@@ -155,22 +156,18 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   ok(barrierAt(tr.barrier, sAt, -1) && !barrierAt(tr.barrier, sAt, 1), 'hairpin outside guarded, inside open', `s=${sAt.toFixed(0)}`);
   const s = createSimState();
   resetRun(s, tr, 0);
-  // Push to the outside (-1 side: lat<0 on this right turn). placeOut
-  // indexes z-meters, so step the index manually at the curve station.
   placeCurveOut(s, tr, mid, -(LIM - 0.5), -25);
   let gHit = false;
   for (let k = 0; k < 8 && !gHit; k++) { if (simStep(s, tr, drive, DT).wallHit) gHit = true; }
   ok(gHit, 'curved outside rebounds');
-  // Push to the inside (+1): open fall.
   placeCurveOut(s, tr, mid, LIM - 0.5, 25);
   let hit = false;
   let info = simStep(s, tr, drive, DT);
   for (let k = 0; k < 120; k++) {
     if (info.wallHit) hit = true;
-    if (!s.grounded) break;
     info = simStep(s, tr, drive, DT);
   }
-  ok(!hit && !s.grounded, 'curved inside falls');
+  ok(!hit && s.grounded, 'curved inside stays on dirt');
 }
 
 // 5. Visual/physics mask identity: rails render exactly where sim collides.
@@ -190,7 +187,6 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
     if (!barrierAt(plan, tr.cum[g.idx[k]], g.side[k] as 1 | -1)) { allGuarded = false; break; }
   }
   ok(allGuarded, 'every rendered rail collides (mask identity)');
-  // Mount bridging rule: same-side consecutive stations stay within one span.
   let bridged = true;
   for (const sd of [1, -1]) {
     const st: number[] = [];
@@ -200,57 +196,57 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
     }
   }
   ok(bridged, 'no rail segment bridges an open gap');
-  // Legacy null plan keeps uniform both-sides rails (old tests/visuals).
   const legacy = planGuardrails(tr.cum, resolveOptions({}));
   ok(legacy.idx.length > g.idx.length, 'span plan trims rails vs legacy', `${legacy.idx.length} -> ${g.idx.length}`);
   console.log(`[measure] rails legacy=${legacy.idx.length} span=${g.idx.length} spans=${plan.spans.length}`);
 }
 
-// 6. Shoulder is supported runoff; past it is flight.
+// 6. Ground is supported at every lateral distance; the verge blends from the
+// road edge down to the plain.
 {
   const tr = straight();
   tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
   const s = createSimState();
   resetRun(s, tr, 0);
-  placeOut(s, tr, 200, HALF + 2, 0, 40); // inside shoulder, rolling straight
+  placeOut(s, tr, 200, HALF + 2, 0, 40); // on the verge
   const info = simStep(s, tr, drive, DT);
-  ok(s.grounded && Math.abs(s.py - (tr.y[s.lastIdx] + 0.2)) < 1e-9, 'shoulder snaps to road height');
-  ok(info.offroad, 'shoulder counts as offroad');
-  placeOut(s, tr, 200, SUPPORT + 0.6, 0, 40); // past the shoulder
+  ok(s.grounded && info.offroad, 'verge is offroad and supported');
+  const surf = groundSurfaceY(tr.y[s.lastIdx], latOf(s, tr), HALF);
+  ok(surf < tr.y[s.lastIdx] && surf > DIRT_PLAIN_Y, 'verge sits between road and plain', `surf=${surf.toFixed(2)}`);
+  ok(Math.abs(s.py - (surf + 0.2)) < 1e-6, 'verge snaps to the blended surface', `py=${s.py.toFixed(2)}`);
+  placeOut(s, tr, 200, PLAIN_LAT, 0, 40); // far out on the plain
   simStep(s, tr, drive, DT);
-  ok(!s.grounded, 'past shoulder departs into fall');
+  ok(s.grounded && Math.abs(s.py - (DIRT_PLAIN_Y + 0.2)) < 1e-6, 'plain supports the car at plain height', `py=${s.py.toFixed(2)}`);
 }
 
-// 7. Respawn after an OOB fall: snapshot + exact 3s ghost gap, OOB cleared.
+// 7. Respawn after going OOB on the plain: snapshot + exact 3s gap, OOB cleared.
 {
   const tr = straight();
   tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
   const s = createSimState();
   resetRun(s, tr, 0);
   for (let k = 0; k < 120; k++) simStep(s, tr, drive, DT); // clean running builds snapshot
-  placeOut(s, tr, 300, SUPPORT + 5, 20, 40);
+  placeOut(s, tr, 300, HALF + OOB_EXTRA_LAT + 5, 20, 40);
   let info = simStep(s, tr, drive, DT);
-  for (let k = 0; k < 200 && info.oobMs <= OOB_ARM_MS; k++) info = simStep(s, tr, drive, DT);
-  ok(info.oobMs > 0, 'OOB latched during fall');
+  for (let k = 0; k < 300 && info.oobMs <= OOB_ARM_MS; k++) info = simStep(s, tr, drive, DT);
+  ok(info.oobMs > 0, 'OOB latched far out on the plain');
   const nRec = s.rec.p.length;
   const msBefore = s.raceMs;
   simRespawn(s);
   ok(s.grounded && s.oobMs === 0, 'respawn clears OOB, grounded on snapshot');
   ok(Math.abs(s.raceMs - (msBefore + RESPAWN_PENALTY_MS)) < 1e-9, 'respawn adds the exact 3s gap');
   ok(s.rec.p.length === nRec, 'ghost recording untouched by respawn teleport');
-  // Ghost timestamps stay strictly increasing across the fall.
   let ordered = true;
   for (let k = 1; k < s.rec.ts.length; k++) if (!(s.rec.ts[k] > s.rec.ts[k - 1])) { ordered = false; break; }
-  ok(ordered, 'ghost timestamps strictly increasing through fall');
+  ok(ordered, 'ghost timestamps strictly increasing through the excursion');
 }
 
-// 8. Finish/cut regression: off-course flight cannot finish; legit runs can.
+// 8. Finish/cut regression: off-course wandering cannot finish; legit runs can.
 {
   const tr = straight(400);
   tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
   const s = createSimState();
   resetRun(s, tr, 0);
-  // Fling far past the finish laterally: progress freezes, no finish.
   const e = tr.n - 1;
   s.lastIdx = 0;
   s.px = tr.x[e] + 60; s.pz = tr.z[e] + 5; s.py = tr.y[e] + 0.2;
@@ -258,9 +254,8 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading;
   let fin = false;
   for (let k = 0; k < 120; k++) { if (simStep(s, tr, drive, DT).finished) { fin = true; break; } }
-  ok(!fin && !s.finished, 'off-course flight cannot finish');
+  ok(!fin && !s.finished, 'off-course wandering cannot finish');
   ok(s.lastIdx < tr.n - 60, 'progress frozen off course', `lastIdx=${s.lastIdx}`);
-  // Legit run on the same open track still finishes exactly once.
   const s2 = createSimState();
   resetRun(s2, tr, 0);
   let nFin = 0;
@@ -268,32 +263,30 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   ok(nFin === 1, 'legit open-edge run finishes exactly once');
 }
 
-// 9. OOB timing + decay.
+// 9. OOB timing + decay far out on the plain.
 {
   const tr = straight();
   tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
   const s = createSimState();
   resetRun(s, tr, 0);
-  placeOut(s, tr, 200, SUPPORT + 1, 15, 30);
+  placeOut(s, tr, 200, HALF + OOB_EXTRA_LAT + 1, 15, 30);
   let armAt = -1;
-  for (let k = 0; k < 300; k++) {
+  for (let k = 0; k < 400; k++) {
     const info = simStep(s, tr, drive, DT);
     if (info.oobMs > OOB_ARM_MS) { armAt = (k + 1) * DT; break; }
   }
-  ok(armAt > 0.3 && armAt < 2.0, 'OOB arms after a short interval', `armAt=${armAt?.toFixed(2)}s`);
+  ok(armAt > 0.3 && armAt < 2.0, 'OOB arms after a short interval on the plain', `armAt=${armAt?.toFixed(2)}s`);
   simRespawn(s);
   const info = simStep(s, tr, drive, DT);
   ok(info.oobMs === 0, 'OOB decays on clean road');
 }
 
 // 10. Start-backstop proximity gate: loop-back sections far from the start
-// that cross the start plane must not trigger the backstop (it ate all
-// backward velocity and stalled the car); genuine start-line reversals
-// within metres of the start are still blocked.
+// that cross the start plane must not trigger the backstop; genuine start-line
+// reversals within metres of the start are still blocked.
 {
   const tr = straight(1200);
   tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
-  // Far point behind the start plane: x/z hundreds of units away laterally.
   const s = createSimState();
   resetRun(s, tr, 0);
   s.lastIdx = 300;
@@ -306,7 +299,6 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   const info = simStep(s, tr, drive, DT);
   ok(!info.finished, 'far probe takes a normal step');
   ok(s.vz < -60, 'far loop-back keeps backward velocity', `vz=${s.vz.toFixed(1)}`);
-  // Near start, behind the plane: still pushed back, backward speed killed.
   const s2 = createSimState();
   resetRun(s2, tr, 0);
   s2.px = tr.x[0]; s2.pz = tr.z[0] - 5; s2.py = tr.y[0] + 0.2;
@@ -322,8 +314,7 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
 }
 
 // 11. Rail span starts are not invisible walls: the clamp guard must be
-// evaluated at the car course position, not at lastIdx (nearest sample to
-// the car center, which trails wall contact, firing up to ~8u early).
+// evaluated at the car course position, not at lastIdx.
 {
   const tr = straight();
   tr.barrier = { spans: [{ aS: 200, bS: 400, side: 1 }], length: tr.cum[tr.cum.length - 1] };

@@ -15,14 +15,30 @@ import {
   fmt, buildShareText, buildShareUrl, parseShareUrl,
   shareRun, shouldUseNativeShare,
 } from './share';
-import { acceptDailyTrack, TRACK_HALF_W, arcLengths, markerStations } from './trackgen';
+import { TRACK_HALF_W, arcLengths, markerStations } from './trackgen';
+import { parseCourseMode, resolveCourse } from './courses';
+import type { CourseMode, CourseInfo } from './courses';
+import {
+  speedKmh, exitFeedback, createLesson, advanceLesson, lessonText,
+  createPractice, recordPracticeExit, practiceText,
+  medalFor, nextTargetText, sectorDeltas, sectorSummaryText,
+  recordsPB, appendCourseMode,
+} from './driving-feedback';
+import type { LessonState, PracticeState, DriftObservation } from './driving-feedback';
+import { createAudioEngine } from './audio';
+import type { AudioContextLike } from './audio';
 import { planBarriers, barrierAt } from './barrier-plan';
 import {
   mountVisuals, trailTarget, trailSmooth, trailWidth, trailLength,
   trailShade, trailSpawnEvery, dustBurst, dustSpread,
 } from './visuals';
-import { createMotionState, resetMotion, updateMotion, cameraOutput, impulseLength, DEFAULT_TUNING } from './render-motion';
-import { mountEnvironment } from './environment';
+import { createMotionState, resetMotion, updateMotion, cameraOutput, impulseLength, DEFAULT_TUNING, SPEED_FULL } from './render-motion';
+import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from './surface';
+import {
+  countdownLen, clearTouch, retryDisplayReset, neutralRunInfo,
+  stuckPrompt, offCoursePrompt, rescuePenaltyToast, retryKey,
+} from './retry-control';
+import { mountEnvironment, groundPlainBounds, GROUND_PLAIN_MIN_SIZE, GROUND_PLAIN_SNAP } from './environment';
 import type { EnvKit } from './environment';
 function todayStr(): string {
   const d = new Date();
@@ -30,19 +46,36 @@ function todayStr(): string {
 }
 
 // ---------- config from URL (parsed + validated by ./share.ts, never throws) ----------
+function lsGet(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
+function lsSet(key: string, value: string): void { try { localStorage.setItem(key, value); } catch { /* quota */ } }
+
 const parsed = parseShareUrl(location.search);
-const day: string = parsed.day || todayStr();
+const requestedDay: string = parsed.day || todayStr();
+// Course mode (./courses.ts): daily is the default; fixed practice/benchmark
+// courses are authored and carry recorded references. Mode is preserved in
+// share links so a link resolves the same course on the receiving side.
+const mode: CourseMode = parseCourseMode(location.search);
+const course: CourseInfo = resolveCourse(mode, requestedDay);
+const day: string = course.identityDay;
 const sharedTime: number = parsed.timeMs;
+// Course-isolated PB storage (mode + geometry checksum + version). The fresh
+// physics era starts clean competition: legacy per-day keys from the old
+// physics envelope are left untouched on disk but are neither read nor written,
+// so a stale old-physics run can never seed a new-competition PB/ghost.
+const bestKey = `${course.storageKey}-best`;
+const ghostKey = `${course.storageKey}-ghost`;
 let pbGhost: GhostData | null = null;
-try {
-  const pb = decodeGhost(localStorage.getItem(`canyon-ghost-${day}`));
+{
+  const pb = decodeGhost(lsGet(ghostKey));
   if (pb && pb.p.length > 1) pbGhost = pb;
-} catch { /* ignore */ }
+}
 // Identity-gated rival (./ghost.ts): only a course-matched ghost races.
-// Resolution happens after the daily track loads (checksum = geometry proof).
+// Resolution happens after the course track loads (checksum = geometry proof).
 let rival: RivalGhost | null = null;
 let sharedGhost: GhostData | null = null;
 let rivalNotice = '';
+let ghostIsReference = false;
+let preferReference = false;
 
 // ---------- renderer / scene ----------
 const canvas = document.getElementById('game') as HTMLCanvasElement;
@@ -102,58 +135,95 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
-// ---------- daily canyon sprint: grammar-built track, verified on acceptance ----------
-const rng = mulberry32(hashSeed('canyon-' + day));
-// Grammar-based daily sprint (see ./trackgen.ts): explicit corner events verified
-// against the measured handling envelope before acceptance.
-// The decor rng below stays independent of track acceptance.
-// Accepted-track diagnostics ("canyon-debug" in console).
-const daily = acceptDailyTrack(day);
-if (typeof console !== 'undefined') console.log('[canyon-debug] track', day, 'attempt', daily.attempt, 'fallback', daily.fallback, 'len', daily.stats.length.toFixed(0), 'est', daily.estTimeS.toFixed(1) + 's');
-const pts = daily.points.map((p) => new THREE.Vector3(p.x, p.y, p.z));
+// ---------- course track (./courses.ts): daily grammar or fixed authored ----------
+const rng = mulberry32(hashSeed('canyon-' + mode + '-' + day));
+const courseTrack = course.track;
+if (typeof console !== 'undefined') console.log('[canyon-debug] course', mode, day, 'attempt', courseTrack.attempt, 'fallback', courseTrack.fallback, 'len', courseTrack.stats.length.toFixed(0), 'est', courseTrack.estTimeS.toFixed(1) + 's');
+const pts = courseTrack.points.map((p) => new THREE.Vector3(p.x, p.y, p.z));
 const HALF_W = TRACK_HALF_W;
-const expectedTrack = makeExpectedTrack(day, daily.checksum);
-{
-  const decision = resolveRivalIdentity({ shared: parsed.ghost, pb: pbGhost, expected: expectedTrack });
-  rival = decision.rival;
-  sharedGhost = rival ? rival.ghost : null;
-  rivalNotice = decision.notice;
-  if (rivalNotice && typeof console !== 'undefined') console.log('[canyon-debug] rival', decision.status, rivalNotice);
-}
+const expectedTrack = makeExpectedTrack(day, courseTrack.checksum);
 const track = trackFromPoints(pts.map((p) => ({ x: p.x, y: p.y, z: p.z })), HALF_W);
 const tangents: THREE.Vector3[] = track.tx.map((x, k) => new THREE.Vector3(x, 0, track.tz[k]));
 const normals: THREE.Vector3[] = track.nx.map((x, k) => new THREE.Vector3(x, 0, track.nz[k]));
 // Arc-distance table for flow markers: dashes/curbs/posts keyed to metres of
 // road, not sample index, so readability holds at any sample spacing.
-const cum = arcLengths(daily.points);
+const cum = arcLengths(courseTrack.points);
 // Explicit barrier contract (Cycle 7): only these spans collide AND render.
 // Open edges allow off-course flight/falls; sim gates wall contact on the
 // same plan, visuals render rails exactly on it — one mask, no divergence.
-track.barrier = planBarriers(cum[cum.length - 1], daily.stats.events, daily.crestS);
+track.barrier = planBarriers(cum[cum.length - 1], courseTrack.stats.events, courseTrack.crestS);
 if (typeof console !== 'undefined') console.log('[canyon-debug] barriers',
   `spans=${track.barrier.spans.length}`);
 // P0 splits: 3 grammar-derived checkpoints (S1/S2/S3) + finish. Positions are
 // arc metres; sample indices via the cum table. No track format change.
-const splitIdx = splitPositions(daily.stats.events).map((sp) => splitSampleIdx(cum, sp));
+const splitIdx = splitPositions(courseTrack.stats.events).map((sp) => splitSampleIdx(cum, sp));
 let runSplits: (number | null)[] = splitIdx.map(() => null);
 let splitExpiry = 0;
 
-// ground
+// ground: one expansive dirt plain (sized from the full course bounds with a
+// generous margin) plus a sloping verge ribbon that meets the road at the
+// shared ./surface.ts height. Replaces the old finite 2600 floor + mesa; there
+// is no hard ground edge or visual void anywhere near the course.
+// The plane is also recentred on the camera in whole grid steps each frame
+// (cheap: one uniform 2-triangle mesh) so driving far onto the dirt plain can
+// never expose the plane edge inside the 2000u camera far plane.
+let groundPlain: THREE.Mesh | null = null;
 {
-  const end = pts[pts.length - 1];
-  const midX = (pts[0].x + end.x) / 2, midZ = (pts[0].z + end.z) / 2;
-  const g = new THREE.Mesh(
-    new THREE.PlaneGeometry(2600, 2600),
-    new THREE.MeshLambertMaterial({ color: 0xc96f3f })
+  const bounds = groundPlainBounds(courseTrack.points, 1200);
+  const size = Math.max(bounds.size, GROUND_PLAIN_MIN_SIZE);
+  const plain = new THREE.Mesh(
+    new THREE.PlaneGeometry(size, size),
+    new THREE.MeshLambertMaterial({ color: 0xbe7038 })
   );
-  g.rotation.x = -Math.PI / 2; g.position.set(midX, -2.5, midZ);
-  scene.add(g);
-  const mesa = new THREE.Mesh(
-    new THREE.CylinderGeometry(760, 820, 24, 28),
-    new THREE.MeshLambertMaterial({ color: 0xa9502c })
-  );
-  mesa.position.set(midX, -14, midZ);
-  scene.add(mesa);
+  plain.rotation.x = -Math.PI / 2;
+  // A hair below the shared plain height so the verge seam can never z-fight
+  // the huge plane (the sim still grounds the car on DIRT_PLAIN_Y itself).
+  plain.position.set(bounds.cx, DIRT_PLAIN_Y - 0.05, bounds.cz);
+  scene.add(plain);
+  groundPlain = plain;
+  // Verge: per-side ribbon sampled laterally through groundSurfaceY, so the
+  // rendered bank is exactly the surface the car drives (smoothstep from the
+  // road edge down to the plain over DIRT_VERGE_WIDTH).
+  const verge = (side: number): THREE.Mesh => {
+    // Metres beyond the road edge, ending exactly at the shared verge width so
+    // the ribbon always meets the flat plain no matter how the width is tuned.
+    const cols = [0, 0.22, 0.5, 0.78, 1].map((f) => f * DIRT_VERGE_WIDTH);
+    const n = pts.length;
+    const pos = new Float32Array(n * cols.length * 3);
+    const col = new Float32Array(n * cols.length * 3);
+    const idx: number[] = [];
+    const c = new THREE.Color();
+    const near = new THREE.Color(0xc98d54);
+    const far = new THREE.Color(0xa05f33);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < cols.length; j++) {
+        const lat = side * (HALF_W + cols[j]);
+        const k = i * cols.length + j;
+        pos.set([
+          pts[i].x + normals[i].x * lat,
+          groundSurfaceY(pts[i].y, lat, HALF_W),
+          pts[i].z + normals[i].z * lat,
+        ], k * 3);
+        c.copy(near).lerp(far, Math.min(1, cols[j] / DIRT_VERGE_WIDTH));
+        col.set([c.r, c.g, c.b], k * 3);
+      }
+      if (i < n - 1) {
+        for (let j = 0; j < cols.length - 1; j++) {
+          const a = i * cols.length + j, b = a + 1;
+          const d = (i + 1) * cols.length + j, e = d + 1;
+          idx.push(a, b, d, b, e, d);
+        }
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    return new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  };
+  scene.add(verge(1));
+  scene.add(verge(-1));
 }
 // road ribbon
 function ribbon(width: number, yOff: number, colorFn: (i: number, side: number) => THREE.Color): THREE.Mesh {
@@ -259,7 +329,7 @@ const threeKit = {
 };
 const visuals = mountVisuals(threeKit, scene, {
   points: pts, tangents, normals, cum,
-  events: daily.stats.events, crestS: daily.crestS,
+  events: courseTrack.stats.events, crestS: courseTrack.crestS,
 }, { mobile: coarse, halfW: HALF_W, barriers: track.barrier });
 visuals.setQuality(coarse);
 // Cohesive canyon environment (./environment.ts): two wall depth layers with
@@ -272,7 +342,7 @@ const envKit: EnvKit = { ...threeKit,
   TorusGeometry: THREE.TorusGeometry, BufferAttribute: THREE.BufferAttribute };
 const env = mountEnvironment(envKit, scene, {
   points: pts, tangents, normals, cum,
-  events: daily.stats.events, crestS: daily.crestS,
+  events: courseTrack.stats.events, crestS: courseTrack.crestS,
 }, { mobile: coarse, halfW: HALF_W });
 env.setQuality(coarse);
 if (typeof console !== 'undefined') console.log('[canyon-debug] visuals',
@@ -442,8 +512,30 @@ const car = buildCar(0xff7a1a);
 car.rotation.order = 'YXZ'; // yaw -> pitch -> lean, matches old yaw+lean visuals at pitch 0
 scene.add(car);
 const ghostCar = buildCar(0x35d6ff, true);
-ghostCar.visible = !!sharedGhost;
 scene.add(ghostCar);
+// Rival selection: a course-matched friend link or PB races; a recorded
+// REFERENCE fills in when nothing else is available and can be toggled in the
+// menu. Fail-closed: stale/mismatched ghosts never race (./ghost.ts).
+function selectRival() {
+  const decision = resolveRivalIdentity({ shared: parsed.ghost, pb: pbGhost, expected: expectedTrack });
+  const ref = course.reference && course.reference.p.length > 1 ? course.reference : null;
+  ghostIsReference = false;
+  let chosen: RivalGhost | null = decision.rival;
+  if (preferReference && ref) {
+    chosen = { ghost: ref, kind: 'pb', racingPB: false };
+    ghostIsReference = true;
+  } else if (!chosen && ref) {
+    chosen = { ghost: ref, kind: 'pb', racingPB: false };
+    ghostIsReference = true;
+  }
+  rival = chosen;
+  sharedGhost = chosen ? chosen.ghost : null;
+  rivalNotice = decision.notice;
+  if (ghostIsReference) rivalNotice = (rivalNotice ? rivalNotice + ' ' : '') + 'Racing the REFERENCE run.';
+  ghostCar.visible = !!sharedGhost;
+  if (rivalNotice && typeof console !== 'undefined') console.log('[canyon-debug] rival', decision.status, rivalNotice);
+}
+selectRival();
 const wheels = car.userData.wheels as { steer: THREE.Group[]; spin: THREE.Group[] };
 // blob shadow (cheap grounding cue, stays on the road under jumps)
 const blob = new THREE.Mesh(
@@ -467,15 +559,19 @@ let skidIdx = 0;
 const SKID_FAINT = new THREE.Color(0x4a4750);
 const SKID_DARK = new THREE.Color(0x0e0d0e);
 const _skShade = new THREE.Color();
-{
-  const hide = new THREE.Matrix4().makeScale(0, 0, 0);
+const _skHideM = new THREE.Matrix4().makeScale(0, 0, 0);
+// Full retry clears the previous run's skid residue: a fresh run must not
+// start on top of stale marks from the attempt it is replacing.
+function clearSkids() {
   for (let i = 0; i < SKID_N; i++) {
-    skids.setMatrixAt(i, hide);
+    skids.setMatrixAt(i, _skHideM);
     skids.setColorAt(i, SKID_FAINT);
   }
   skids.instanceMatrix.needsUpdate = true;
   if (skids.instanceColor) skids.instanceColor.needsUpdate = true;
+  skidIdx = 0;
 }
+clearSkids();
 const _skM = new THREE.Matrix4();
 const _skQ = new THREE.Quaternion();
 const _skE = new THREE.Euler();
@@ -510,6 +606,11 @@ scene.add(dust);
 const input = { steer: 0, drift: false, left: false, right: false, keyDrift: false };
 const tc = new TouchState();
 addEventListener('keydown', (ev) => {
+  ensureAudio();
+  if (ev.key === 'Escape' || ev.key === 'p' || ev.key === 'P') {
+    setPaused(!paused);
+    ev.preventDefault();
+  }
   if (ev.key === 'f' || ev.key === 'F') {
     showDebug = !showDebug;
     debugEl.classList.toggle('hidden', !showDebug);
@@ -521,6 +622,7 @@ addEventListener('keydown', (ev) => {
   if (ev.key === 'r' || ev.key === 'R') doRespawn();
   if (ev.key === 'Enter' && state === 'menu') startRun(false);
   if (ev.key === 'Enter' && state === 'finish') startRun(true);
+  if (ev.key === 'Enter' && state === 'run') startRun(true);
 });
 addEventListener('keyup', (ev) => {
   if (ev.key === 'ArrowLeft' || ev.key === 'a') input.left = false;
@@ -533,8 +635,9 @@ const stick = document.getElementById('stick')!;
 const knob = document.getElementById('knob')!;
 const driftBtn = document.getElementById('driftbtn')!;
 const resetBtn = document.getElementById('resetbtn')!;
-resetBtn.addEventListener('pointerdown', (ev) => { ev.preventDefault(); doRespawn(); });
+resetBtn.addEventListener('pointerdown', (ev) => { ev.preventDefault(); ensureAudio(); doRespawn(); });
 stick.addEventListener('pointerdown', (ev) => {
+  ensureAudio();
   tc.stickDown(ev.pointerId, ev.clientX);
   try { (ev.target as Element).setPointerCapture(ev.pointerId); } catch { /* noop */ }
 });
@@ -549,6 +652,7 @@ const stickEnd = (ev: PointerEvent) => {
 stick.addEventListener('pointerup', stickEnd);
 stick.addEventListener('pointercancel', stickEnd);
 driftBtn.addEventListener('pointerdown', (ev) => {
+  ensureAudio();
   tc.driftDown(ev.pointerId);
   try { driftBtn.setPointerCapture(ev.pointerId); } catch { /* noop */ }
   driftBtn.classList.add('on');
@@ -560,6 +664,36 @@ const driftEnd = (ev: PointerEvent) => {
 };
 driftBtn.addEventListener('pointerup', driftEnd);
 driftBtn.addEventListener('pointercancel', driftEnd);
+// P0 reliable controls: a held key released outside the window never sticks.
+// Blur / tab-hide / page-hide clears keyboard + touch state together and
+// recenters the visible stick, so returning has no phantom steering or drift
+// and the next press works. Retries also route through here (see startRun).
+function clearAllInput() {
+  input.left = false; input.right = false; input.keyDrift = false;
+  input.steer = 0; input.drift = false;
+  clearTouch(tc);
+  knob.style.transform = 'translate(-50%,-50%)';
+  driftBtn.classList.remove('on');
+}
+addEventListener('blur', clearAllInput);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearAllInput();
+    audio.suspend();
+    if (state === 'run' || state === 'countdown' || state === 'watch') setPaused(true);
+  } else {
+    audio.resume();
+  }
+});
+addEventListener('pagehide', clearAllInput);
+// Full-run retry button (accessible, desktop + mobile): same complete reset
+// as Enter mid-run. R stays a mid-run rescue with its 3-second penalty.
+const retryBtn = document.getElementById('retrybtn') as HTMLButtonElement;
+retryBtn.textContent = `\u21bb ${retryKey(coarse)}`; // ENTER RETRY (desktop) / RETRY (touch)
+retryBtn.addEventListener('click', () => {
+  ensureAudio();
+  if (state === 'run' || state === 'countdown') startRun(true);
+});
 function pollKeys() {
   if (input.left && !input.right) input.steer = -1;
   else if (input.right && !input.left) input.steer = 1;
@@ -568,9 +702,11 @@ function pollKeys() {
 }
 
 // ---------- race state (simulation lives in sim.ts; this file renders it) ----------
-let state: 'menu' | 'countdown' | 'run' | 'finish' = 'menu';
+let state: 'menu' | 'countdown' | 'run' | 'finish' | 'watch' = 'menu';
 let countdownT = 0;
 let lastFinalMs = 0;
+let watchT = 0; // reference-demonstration playback clock (ms, race time)
+let paused = false;
 const sim = createSimState();
 let snapView = true; // render current pose exactly on teleport frames (car mesh)
 // Deterministic chase-camera + FOV state (./render-motion.ts): lagged
@@ -581,34 +717,214 @@ const camOut = { x: 0, y: 0, z: 0 };
 let showDebug = false;
 let fpsEMA = 60;
 let wallKick = 0; // one-shot visual crash shudder, set on sim wallHit edge, decays per frame
-let lastInfo: StepInfo = {
-  spd: 0, drifting: false, sIdx: 0, pitch: 0,
-  launched: false, landed: false, finished: false,
-  fSpeed: 0, lSpeed: 0, slip: 0, yawRate: 0,
-  offroad: false, surface: 'road', landV: 0,
-  impact: 0, scraping: false, stuckMs: 0, oobMs: 0,
-};
-const bestKey = `canyon-best-${day}`;
-let best = Number(localStorage.getItem(bestKey) || 0);
+let surgeVis = 0; // one-shot clean-exit surge lean/pitch (visual only, bounded)
+let penaltyExpiry = 0; // brief "+3s" rescue charge toast deadline (separate from msgEl)
+function showPenaltyToast(now: number) {
+  penaltyEl.textContent = rescuePenaltyToast();
+  penaltyEl.classList.add('show');
+  penaltyExpiry = now + 1800;
+}
+function clearPenalty() {
+  penaltyEl.textContent = '';
+  penaltyEl.classList.remove('show');
+  penaltyExpiry = 0;
+}
+let lastInfo: StepInfo = neutralRunInfo();
+let best = Number(lsGet(bestKey) || 0);
+
 const timeEl = document.getElementById('time')!;
+const speedEl = document.getElementById('speed')!;
 const bestEl = document.getElementById('best')!;
 const msgEl = document.getElementById('msg')!;
+const penaltyEl = document.getElementById('penalty')!;
+const exitfbEl = document.getElementById('exitfb')!;
+const lessonEl = document.getElementById('lesson')!;
 const progEl = document.getElementById('progfill')!;
 const deltaEl = document.getElementById('delta')!;
 const splitEl = document.getElementById('split')!;
 const panel = document.getElementById('panel')!;
 const presult = document.getElementById('presult')!;
 const ptitle = document.getElementById('ptitle')!;
+const pdateEl = document.getElementById('pdate')!;
+const ptargets = document.getElementById('ptargets')!;
+const pubEl = document.getElementById('psub')!;
+const phintEl = document.getElementById('phint')!;
 const debugEl = document.getElementById('debug')!;
-(document.getElementById('day') as HTMLElement).textContent = `CANYON DAILY · ${day}`;
-function refreshBest() { bestEl.textContent = best > 0 ? `BEST ${fmt(best)}` : (sharedTime > 0 ? `FRIEND ${fmt(sharedTime)}` : 'BEST —'); }
+const raceBtn = document.getElementById('racebtn') as HTMLButtonElement;
+const referenceBtn = document.getElementById('referencebtn') as HTMLButtonElement;
+const muteBtn = document.getElementById('mutebtn') as HTMLButtonElement;
+const fsBtn = document.getElementById('fsbtn') as HTMLButtonElement;
+const pauseOverlay = document.getElementById('pauseoverlay')!;
+const resumeBtn = document.getElementById('resumebtn') as HTMLButtonElement;
+const pauseMenuBtn = document.getElementById('pausemenubtn') as HTMLButtonElement;
+const pausePlayBtn = document.getElementById('pauseplaybtn') as HTMLButtonElement;
+const stopBtn = document.getElementById('stopbtn') as HTMLButtonElement;
+// Header shows the real date only for daily; fixed courses must not leak the
+// internal 2026-01-01/02 identity day.
+(document.getElementById('day') as HTMLElement).textContent = mode === 'daily' ? `CANYON DAILY · ${day}` : course.title.toUpperCase();
+function refreshBest() {
+  if (best > 0) bestEl.textContent = `BEST ${fmt(best)}`;
+  else if (sharedTime > 0) bestEl.textContent = `FRIEND ${fmt(sharedTime)}`;
+  else bestEl.textContent = 'BEST —';
+}
 refreshBest();
 
+// ---------- audio (single bounded graph, built on first gesture) ----------
+const audio = createAudioEngine({
+  createContext: () => {
+    const w = window as unknown as { AudioContext?: new () => AudioContextLike; webkitAudioContext?: new () => AudioContextLike };
+    const AC = w.AudioContext || w.webkitAudioContext;
+    if (!AC) throw new Error('no AudioContext');
+    return new AC();
+  },
+  storage: (() => { try { return localStorage; } catch { return null; } })(),
+});
+let audioStarted = false;
+function updateMuteBtn() { muteBtn.textContent = audio.isMuted() ? 'SOUND OFF' : 'SOUND ON'; }
+function ensureAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  try { audio.start(); } catch { /* audio unavailable */ }
+  updateMuteBtn();
+}
+
+// ---------- drift lesson / practice / exit feedback ----------
+const lesson: LessonState = createLesson();
+let lessonSeen = lsGet('canyon-drift-lesson-seen') === '1';
+// Practice progress persists across retries (and reloads) in this session so a
+// multi-exit goal is achievable without replaying from zero each attempt.
+const practiceSaveKey = `${course.storageKey}-practice`;
+const practice: PracticeState = createPractice(5);
+{
+  const raw = lsGet(practiceSaveKey);
+  if (raw) {
+    const [c, p] = raw.split(',');
+    const cn = Number(c), pn = Number(p);
+    if (isFinite(cn) && cn >= 0) practice.clean = Math.floor(cn);
+    if (isFinite(pn) && pn >= 0) practice.perfect = Math.floor(pn);
+  }
+}
+function savePractice() { lsSet(practiceSaveKey, `${practice.clean},${practice.perfect}`); }
+let pendingDrift: { event: DriftObservation['event']; grade: DriftObservation['grade'] } | null = null;
+let exitFbExpiry = 0;
+function clearExitFeedback() { exitfbEl.textContent = ''; exitfbEl.classList.remove('show'); exitFbExpiry = 0; }
+
+// ---------- menu mode + player controls ----------
+function gotoMode(next: CourseMode) {
+  const url = new URL(location.href);
+  if (next === 'daily') url.searchParams.delete('mode');
+  else url.searchParams.set('mode', next);
+  location.assign(url.toString());
+}
+const modeBtnEls: Record<CourseMode, HTMLButtonElement> = {
+  daily: document.getElementById('modedaily') as HTMLButtonElement,
+  practice: document.getElementById('modepractice') as HTMLButtonElement,
+  benchmark: document.getElementById('modebenchmark') as HTMLButtonElement,
+};
+for (const m of ['daily', 'practice', 'benchmark'] as CourseMode[]) {
+  modeBtnEls[m].onclick = () => gotoMode(m);
+  modeBtnEls[m].classList.toggle('active', m === mode);
+}
+function refreshRefButtons() {
+  const hasRef = !!course.reference;
+  // The race toggle only matters when there is a second rival to switch to.
+  const hasAlt = best > 0 || !!parsed.ghost || sharedTime > 0;
+  raceBtn.classList.toggle('hidden', !(hasRef && hasAlt));
+  referenceBtn.classList.toggle('hidden', !hasRef);
+  if (hasRef) raceBtn.textContent = preferReference ? 'RACE MY BEST' : 'RACE REFERENCE';
+}
+refreshRefButtons();
+raceBtn.onclick = () => { preferReference = !preferReference; selectRival(); refreshRefButtons(); };
+referenceBtn.onclick = () => startWatch();
+muteBtn.onclick = () => { ensureAudio(); audio.toggleMuted(); updateMuteBtn(); };
+updateMuteBtn();
+fsBtn.onclick = () => {
+  const el = document.documentElement as HTMLElement & { webkitRequestFullscreen?: () => void };
+  if (document.fullscreenElement) void document.exitFullscreen?.();
+  else if (el.requestFullscreen) void el.requestFullscreen();
+  else el.webkitRequestFullscreen?.();
+};
+resumeBtn.onclick = () => setPaused(false);
+pauseMenuBtn.onclick = () => { setPaused(false); toMenu(); };
+function targetText(): string {
+  const t = course.targets;
+  if (best > 0) {
+    const m = medalFor(best, t);
+    return `BEST ${fmt(best)} · ${m === 'none' ? 'NO MEDAL YET' : m.toUpperCase()} · GOLD ${fmt(t.goldMs)}`;
+  }
+  return `TARGETS — GOLD ${fmt(t.goldMs)} · SILVER ${fmt(t.silverMs)} · BRONZE ${fmt(t.bronzeMs)}`;
+}
+function menuResultText(): string {
+  const parts: string[] = [];
+  if (best > 0) parts.push(`Your best ${fmt(best)}`);
+  if (sharedTime > 0) parts.push(`Friend ${fmt(sharedTime)}`);
+  if (rivalNotice) parts.push(rivalNotice);
+  // selectRival already appends the REFERENCE label into rivalNotice.
+  if (!ghostIsReference && (rival || sharedTime)) parts.push(rivalLabel(rival, sharedTime));
+  else if (!ghostIsReference) parts.push(course.reference ? 'Race the reference, then watch it' : 'Point-to-point sprint · flat out, drift the hairpins');
+  return parts.join(' · ');
+}
+function setPaused(p: boolean) {
+  if (state !== 'run' && state !== 'countdown' && state !== 'watch') return;
+  paused = p;
+  pauseOverlay.classList.toggle('hidden', !p);
+  pausePlayBtn.textContent = p ? 'RESUME' : 'PAUSE';
+  if (p) audio.suspend(); else audio.resume();
+}
+function toMenu() {
+  paused = false;
+  pauseOverlay.classList.add('hidden');
+  pausePlayBtn.textContent = 'PAUSE';
+  state = 'menu';
+  document.body.classList.remove('racing', 'watching');
+  panel.classList.remove('hidden');
+  car.visible = true;
+  ghostCar.visible = !!sharedGhost;
+  msgEl.textContent = '';
+  deltaEl.textContent = ''; deltaEl.className = '';
+  timeEl.textContent = '0:00.00';
+  speedEl.textContent = '0 km/h';
+  progEl.style.width = '0%';
+  clearExitFeedback();
+  audio.reset();
+}
+function startWatch() {
+  if (!course.reference || course.reference.p.length < 2) return;
+  ensureAudio();
+  clearAllInput();
+  panel.classList.add('hidden');
+  document.body.classList.add('racing', 'watching');
+  paused = false;
+  pauseOverlay.classList.add('hidden');
+  watchT = 0;
+  state = 'watch';
+  car.visible = false; // demo only: no player car, no PB
+  ghostCar.visible = true;
+  msgEl.textContent = 'REFERENCE — DEMONSTRATION';
+  lessonEl.textContent = '';
+  splitEl.textContent = '';
+  deltaEl.textContent = 'REPLAY'; deltaEl.className = '';
+  timeEl.textContent = '0:00.00';
+  speedEl.textContent = '0 km/h';
+  progEl.style.width = '0%';
+  clearExitFeedback();
+  clearPenalty();
+}
+stopBtn.onclick = () => { setPaused(false); toMenu(); };
+pausePlayBtn.onclick = () => setPaused(!paused);
+
+// Ground height under a point following the shared ./surface.ts contract:
+// road edge -> smooth verge -> flat dirt plain. Used to ground the skid marks,
+// shadow blob and dust so nothing floats at the nearest road height off-road.
+function surfaceYAt(idx: number, x: number, z: number): number {
+  const lat = (x - track.x[idx]) * track.nx[idx] + (z - track.z[idx]) * track.nz[idx];
+  return groundSurfaceY(track.y[idx], lat, HALF_W);
+}
 // Apply sim pose to meshes (car yaw + road/trajectory pitch + blob shadow).
 function syncCarTransform() {
   car.position.set(sim.px, sim.py, sim.pz);
   car.rotation.set(sim.pitch, sim.heading, 0);
-  const gy = track.y[sim.lastIdx] + 0.2;
+  const gy = surfaceYAt(sim.lastIdx, sim.px, sim.pz) + 0.2;
   blob.position.set(sim.px, gy + 0.06, sim.pz);
   blob.scale.setScalar(1 + clamp(sim.py - gy, 0, 12) * 0.04);
 }
@@ -621,10 +937,10 @@ function placeAt(i: number) {
   snapView = true;
 }
 function doRespawn() {
-  // R RESET: mid-run rescue to the last clean snapshot (instant, +3000ms race
-  // penalty with an honest ghost-timestamp gap). Falling off an open edge no
-  // longer discards the run. From the finish panel R retries the run instead
-  // (nothing to rescue once finished — simRespawn is a no-op there).
+  // R RESCUE (+3s): mid-run rescue to the last clean snapshot (instant, real
+  // 3000ms race penalty with an honest ghost-timestamp gap). Falling off an
+  // open edge no longer discards the run. From the finish panel R retries the
+  // run instead (nothing to rescue once finished — simRespawn is a no-op).
   if (state === 'finish') { startRun(true); return; }
   if (state !== 'run') return;
   simRespawn(sim);
@@ -633,6 +949,9 @@ function doRespawn() {
   trailSm = 0;
   trailTick = 0;
   snapView = true;
+  // Surface the charge in its own element so it can never overwrite an urgent
+  // STUCK / OFF COURSE message, then release the message (no longer stuck).
+  showPenaltyToast(performance.now());
   msgEl.textContent = '';
 }
 placeAt(0);
@@ -642,13 +961,45 @@ camera.lookAt(sim.px, sim.py + 1, sim.pz);
 let hasRunOnce = false; // session flag: first GO gets the full 3-2-1, retries get READY-GO
 let cdLen = 3.1;
 function startRun(quick = false) {
+  // Full retry: complete reset of input, recording, splits, camera and loop
+  // debt together, then a quick READY start. The deliberate 3-2-1 only ever
+  // plays for the first start of the session (see ./retry-control.ts).
+  clearAllInput();
   panel.classList.add('hidden');
+  document.body.classList.add('racing');
+  document.body.classList.remove('watching');
+  car.visible = true;
   state = 'countdown'; countdownT = 0; acc = 0;
-  cdLen = quick && hasRunOnce ? 0.7 : 3.1;
+  cdLen = countdownLen(quick, hasRunOnce);
   hasRunOnce = true;
   placeAt(0);
-  deltaEl.textContent = ''; deltaEl.className = '';
-  splitEl.textContent = '';
+  wallKick = 0;
+  surgeVis = 0;
+  splitExpiry = 0;
+  // Reset every displayed run value before the first READY frame: the old
+  // timer, progress fill, delta, split toast and F-telemetry must not survive
+  // the countdown (the countdown branch paints msg only). Retained step-info
+  // is neutralized too, and stale skid residue is cleared.
+  const display = retryDisplayReset();
+  timeEl.textContent = display.time;
+  progEl.style.width = `${display.progressPct}%`;
+  deltaEl.textContent = display.delta; deltaEl.className = '';
+  splitEl.textContent = display.split;
+  debugEl.textContent = display.debug;
+  lastInfo = neutralRunInfo();
+  msgEl.textContent = '';
+  clearPenalty();
+  clearSkids();
+  clearExitFeedback();
+  pendingDrift = null;
+  paused = false;
+  pauseOverlay.classList.add('hidden');
+  audio.reset();
+  speedEl.textContent = '0 km/h';
+  lessonEl.textContent = '';
+  // Practice progress is intentionally NOT reset here: retries continue the
+  // same session objective (persisted under the course key). The first-time
+  // lesson likewise keeps its own progress across retries.
   runSplits = splitIdx.map(() => null);
   camera.position.set(motion.px, motion.py, motion.pz);
   camera.lookAt(motion.lx, motion.ly, motion.lz);
@@ -656,8 +1007,8 @@ function startRun(quick = false) {
   camera.updateProjectionMatrix();
   ghostCar.visible = !!sharedGhost;
 }
-(document.getElementById('drivebtn') as HTMLButtonElement).onclick = () => startRun(state === 'finish');
-canvas.addEventListener('pointerdown', () => { if (state === 'menu') startRun(); });
+(document.getElementById('drivebtn') as HTMLButtonElement).onclick = () => { ensureAudio(); startRun(state === 'finish'); };
+canvas.addEventListener('pointerdown', () => { ensureAudio(); if (state === 'menu') startRun(); });
 
 // wordle-style share: best ghost embedded in link (?d=&t=&g= via ./share.ts).
 // buildShareUrl drops corrupt ghosts; shareRun reports the truthful outcome.
@@ -666,8 +1017,13 @@ canvas.addEventListener('pointerdown', () => { if (state === 'menu') startRun();
   const ms = isFinish ? lastFinalMs : best;
   let g = '';
   if (isFinish) g = encodeGhost(sim.rec, lastFinalMs, GHOST_URL_BUDGET, expectedTrack);
-  else { try { g = localStorage.getItem(`canyon-ghost-${day}`) || ''; } catch { g = ''; } }
-  const url = buildShareUrl(location.origin, location.pathname, { day, timeMs: ms, ghost: g });
+  else g = lsGet(ghostKey) || '';
+  // Course mode travels with the link so the receiver resolves the same course;
+  // daily keeps its `d` date and needs no mode param.
+  const url = appendCourseMode(
+    buildShareUrl(location.origin, location.pathname, { day, timeMs: ms, ghost: g }),
+    mode,
+  );
   const hasGhost = url.includes('&g=');
   const text = buildShareText(day, ms, url);
   const outcome = await shareRun(
@@ -675,7 +1031,7 @@ canvas.addEventListener('pointerdown', () => { if (state === 'menu') startRun();
       requestNativeShare: (d) => navigator.share(d),
       copyText: (t) => navigator.clipboard.writeText(t),
     },
-    { title: 'Canyon Daily', text, url, hasGhost, isFinish },
+    { title: course.title, text, url, hasGhost, isFinish },
     shouldUseNativeShare(coarse, typeof navigator.share === 'function'),
   );
   presult.textContent = outcome.message;
@@ -687,6 +1043,9 @@ function step(dt: number): StepInfo {
   pollKeys();
   const steer = clamp(input.steer, -1, 1);
   const info = simStep(sim, track, { steer, drift: input.drift }, dt);
+  // Capture the last one-shot drift event of this step so lesson/practice/exit
+  // feedback react to the actual reward event, never to a phase guess.
+  if (sim.rhythmOut.event !== 'none') pendingDrift = { event: sim.rhythmOut.event, grade: sim.rhythmOut.grade };
   if (info.finished) finishRun();
   // step-event visuals only (pose rendering happens per render frame, interpolated)
   // Drift trails scale with the actual slide (smoothed drift amount +
@@ -705,13 +1064,19 @@ function step(dt: number): StepInfo {
   }
   const every = trailSpawnEvery(trailSm);
   if (every > 0 && trailTick % every === 0) {
-    const groundY = track.y[sim.lastIdx] + 0.2;
+    const groundY = surfaceYAt(sim.lastIdx, sim.px, sim.pz) + 0.2;
     const fx = Math.sin(sim.heading), fz = Math.cos(sim.heading);
     const rx = -fz, rz = fx;
     const w = trailWidth(trailSm), len = trailLength(trailSm), shade = trailShade(trailSm);
     for (const sd of [1, -1]) {
       skidAt(sim.px - fx * 1.5 + rx * 1.0 * sd, groundY + 0.22, sim.pz - fz * 1.5 + rz * 1.0 * sd, sim.heading, w, len, shade);
     }
+  }
+  // Off-road dirt feedback: restrained slip dust kicked up while sliding on the
+  // plain at speed. sim.py is already grounded on the shared surface, so the
+  // dust sits on the dirt rather than at the nearest road height.
+  if (info.offroad && sim.grounded && info.spd > 12 && trailTick % 2 === 0) {
+    visuals.dust.spawn(sim.px, sim.py + 0.1, sim.pz, 2.4);
   }
   FWD.set(sim.vx, 0, sim.vz);
   return info;
@@ -726,33 +1091,46 @@ function finishRun() {
   const finalMs = Math.round(sim.raceMs);
   lastFinalMs = finalMs;
   const prevBest = best; // captured before the PB write below
-  if (!best || finalMs < best) {
+  // A completed race is the only run kind allowed to write a PB; watching a
+  // reference demonstration never reaches here, and the guard keeps that true.
+  if (recordsPB('race') && (!best || finalMs < best)) {
     best = finalMs;
-    try { localStorage.setItem(bestKey, String(best)); } catch { /* quota */ }
-    try { localStorage.setItem(`canyon-ghost-${day}`, encodeGhost(sim.rec, finalMs, GHOST_URL_BUDGET, expectedTrack)); } catch { /* quota */ }
+    lsSet(bestKey, String(best));
+    const encoded = encodeGhost(sim.rec, finalMs, GHOST_URL_BUDGET, expectedTrack);
+    lsSet(ghostKey, encoded);
     // Session-live rival: the next retry races the new best immediately, no
     // reload. Fail-closed semantics unchanged (bad data races nothing).
     try {
-      const fresh = decodeGhost(localStorage.getItem(`canyon-ghost-${day}`));
+      const fresh = decodeGhost(lsGet(ghostKey));
       pbGhost = fresh && fresh.p.length > 1 ? fresh : null;
-      const decision = resolveRivalIdentity({ shared: parsed.ghost, pb: pbGhost, expected: expectedTrack });
-      rival = decision.rival;
-      sharedGhost = rival ? rival.ghost : null;
-      rivalNotice = decision.notice;
+      selectRival();
     } catch { /* keep previous rival */ }
   }
   refreshBest();
+  refreshRefButtons();
   const isRecord = best === finalMs;
+  const medal = medalFor(finalMs, course.targets);
   ptitle.textContent = isRecord ? 'NEW BEST!' : 'FINISH!';
   const verdict = !prevBest || isRecord
     ? (prevBest ? `by ${fmt(prevBest - finalMs)}` : 'first finished run!')
     : `+${fmt(finalMs - prevBest)} vs best`;
-  presult.textContent = `${fmt(finalMs)} · ${verdict} · best ${fmt(best)}${sharedTime ? ` · friend ${fmt(sharedTime)}` : ''}`;
+  const medalStr = medal === 'none' ? 'no medal' : `${medal.toUpperCase()} medal`;
+  presult.textContent = `${fmt(finalMs)} · ${medalStr} · ${verdict} · best ${fmt(best)}${sharedTime ? ` · friend ${fmt(sharedTime)}` : ''}`;
+  // Real sector gains/losses vs the racing ghost only; blank with no valid ghost.
+  const ghostSplits = sharedGhost ? splitIdx.map((j) => ghostTimeAt(sharedGhost as GhostData, track.x[j], track.z[j])) : [];
+  const sectors = sectorSummaryText(sectorDeltas(runSplits, ghostSplits));
+  ptargets.textContent = `${ghostIsReference ? 'REFERENCE · ' : ''}${nextTargetText(best, course.targets)}${sectors ? ` · ${sectors}` : ''}`;
+  document.body.classList.remove('racing');
   panel.classList.remove('hidden');
   const driveBtn = document.getElementById('drivebtn') as HTMLButtonElement;
   driveBtn.textContent = 'RETRY (Enter)';
   driveBtn.focus();
   msgEl.textContent = '';
+  // The toast expiry only runs in the run branch, so a rescue on the finish
+  // step would otherwise leave "+3s" on screen through the result panel.
+  clearPenalty();
+  clearExitFeedback();
+  if (mode === 'practice') lessonEl.textContent = practiceText(practice, coarse);
 }
 
 // ---------- main loop: fixed-step sim, render interp-lite ----------
@@ -760,22 +1138,75 @@ const timeEl2 = timeEl;
 let last = performance.now();
 let acc = 0;
 const DT = 1 / 60;
+// Keep the huge uniform dirt plain centred under the camera in fixed 500u
+// steps. A flat untextured plane is identical under any whole-grid shift, so
+// this is invisible while guaranteeing ground out past the camera far plane.
+const GROUND_SNAP = GROUND_PLAIN_SNAP;
+function recenterGround() {
+  if (!groundPlain) return;
+  groundPlain.position.x = Math.round(camera.position.x / GROUND_SNAP) * GROUND_SNAP;
+  groundPlain.position.z = Math.round(camera.position.z / GROUND_SNAP) * GROUND_SNAP;
+}
+function renderScene() {
+  recenterGround();
+  renderer.render(scene, camera);
+}
 function frame(now: number) {
   requestAnimationFrame(frame);
   let dt = Math.min((now - last) / 1000, 0.1);
   last = now;
   if (dt > 0) fpsEMA = lerp(fpsEMA, 1 / dt, 0.05);
+  // A paused race, countdown or reference demo freezes on the last frame.
+  if (paused && (state === 'countdown' || state === 'run' || state === 'watch')) {
+    renderScene();
+    return;
+  }
+  // Reference demonstration: play the genuine recorded route with a chase
+  // camera and replay telemetry derived from the recording, then return to the
+  // menu. Never steps the sim, never writes a PB.
+  if (state === 'watch') {
+    const ref = course.reference;
+    if (!ref) { toMenu(); return; }
+    watchT += dt * 1000;
+    const lastT = ref.t;
+    const shown = Math.min(watchT, lastT);
+    const gp = sampleGhost(ref, shown);
+    const back = sampleGhost(ref, Math.max(0, shown - 60));
+    const spd = Math.hypot(gp.x - back.x, gp.z - back.z) / 0.06;
+    timeEl.textContent = fmt(shown);
+    speedEl.textContent = `${speedKmh(spd)} km/h`;
+    progEl.style.width = `${lastT > 0 ? Math.min(100, (shown / lastT) * 100) : 0}%`;
+    ghostCar.visible = true;
+    ghostCar.position.set(gp.x, gp.y, gp.z);
+    ghostCar.rotation.set(0, gp.h, 0);
+    camera.position.set(gp.x - Math.sin(gp.h) * 12, gp.y + 5, gp.z - Math.cos(gp.h) * 12);
+    camera.lookAt(gp.x, gp.y + 1, gp.z);
+    if (watchT > lastT + 700) {
+      msgEl.textContent = 'REFERENCE COMPLETE';
+      if (watchT > lastT + 1600) { toMenu(); return; }
+    }
+    renderScene();
+    return;
+  }
   if (state === 'menu') {
     // slow orbit behind start
     const t = now / 1000;
     camera.position.set(pts[0].x + Math.cos(t * 0.15) * 58, pts[0].y + 24, pts[0].z + Math.sin(t * 0.15) * 58);
     camera.lookAt(pts[0].x, pts[0].y + 1, pts[0].z);
-    ptitle.textContent = `CANYON DAILY · ${day}`;
-    presult.textContent = `${best ? `Your best ${fmt(best)} · ` : ''}${sharedTime ? `Friend ${fmt(sharedTime)} · ` : ''}${rivalNotice ? rivalNotice + ' ' : ''}${rival || sharedTime ? rivalLabel(rival, sharedTime) : 'Point-to-point sprint · flat out, drift the hairpins'}`;
+    ptitle.textContent = course.title.toUpperCase();
+    pdateEl.textContent = mode === 'daily' ? day : '';
+    pubEl.textContent = course.description;
+    ptargets.textContent = targetText();
+    presult.textContent = menuResultText();
+    phintEl.innerHTML = coarse
+      ? 'Mobile: left stick steers · tap DRIFT to slide · steer back the other way to exit · RESCUE returns to the track (+3s)<br/>Controls: tap PAUSE to stop the clock · MENU to quit · RETRY restarts'
+      : 'PC: ← → steer · ↓ / space drift · R rescue (+3s) · Enter retry · Esc / P pause<br/>Drift: hold a direction, tap DRIFT to start the slide, hold it, then countersteer to exit';
     panel.classList.remove('hidden');
     (document.getElementById('drivebtn') as HTMLButtonElement).textContent = 'DRIVE';
     deltaEl.textContent = ''; deltaEl.className = ''; splitEl.textContent = '';
-    renderer.render(scene, camera);
+    speedEl.textContent = '0 km/h';
+    lessonEl.textContent = '';
+    renderScene();
     return;
   }
   if (state === 'countdown') {
@@ -787,7 +1218,7 @@ function frame(now: number) {
       msgEl.textContent = countdownT > cdLen - 0.25 ? 'GO!' : 'READY';
     }
     if (countdownT > cdLen) { state = 'run'; msgEl.textContent = ''; }
-    renderer.render(scene, camera);
+    renderScene();
     return;
   }
   if (state === 'run' || state === 'finish') {
@@ -806,6 +1237,7 @@ function frame(now: number) {
       const rp = interpPose(sim, alpha);
       const ghostMs = lerp(sim.prevRaceMs, sim.raceMs, alpha);
       timeEl2.textContent = fmt(sim.raceMs);
+      speedEl.textContent = `${speedKmh(info.spd)} km/h`;
       progEl.style.width = `${(info.sIdx / (track.n - 1)) * 100}%`;
       // P0-5/P0-7: live delta + gap vs the racing ghost at your position.
       // Blank when no matched ghost races (never fabricate a target).
@@ -813,7 +1245,7 @@ function frame(now: number) {
         const gt = ghostTimeAt(sharedGhost, sim.px, sim.pz);
         if (gt >= 0) {
           const d = sim.raceMs - gt;
-          const label = rival.kind === 'friend' ? 'FRIEND' : 'PB';
+          const label = ghostIsReference ? 'REF' : rival.kind === 'friend' ? 'FRIEND' : 'PB';
           deltaEl.textContent = gapText(d, info.spd, label);
           deltaEl.className = d < 0 ? 'ahead' : 'behind';
         } else { deltaEl.textContent = ''; deltaEl.className = ''; }
@@ -825,7 +1257,8 @@ function frame(now: number) {
           if (sharedGhost) {
             const j = splitIdx[k];
             const gt = ghostTimeAt(sharedGhost, track.x[j], track.z[j]);
-            splitEl.textContent = gt >= 0 ? `S${k + 1} ${gapText(runSplits[k]! - gt, info.spd, rival && rival.kind === 'friend' ? 'FRIEND' : 'PB')}` : `S${k + 1} ${fmt(runSplits[k]!)}`;
+            const splitLabel = ghostIsReference ? 'REF' : rival && rival.kind === 'friend' ? 'FRIEND' : 'PB';
+            splitEl.textContent = gt >= 0 ? `S${k + 1} ${gapText(runSplits[k]! - gt, info.spd, splitLabel)}` : `S${k + 1} ${fmt(runSplits[k]!)}`;
           } else {
             splitEl.textContent = `S${k + 1} ${fmt(runSplits[k]!)}`;
           }
@@ -833,10 +1266,48 @@ function frame(now: number) {
         }
       }
       if (splitEl.textContent !== '' && now > splitExpiry) splitEl.textContent = '';
-      if (info.stuckMs > 1500) msgEl.textContent = 'STUCK — R RESET';
-      else if (info.oobMs > 900) msgEl.textContent = 'OFF COURSE — R RESET';
+      if (penaltyExpiry && now > penaltyExpiry) clearPenalty();
+      // Exit feedback + lesson + practice all react to the actual one-shot drift
+      // event captured in step(), never to a phase guess.
+      const driftEvent = pendingDrift ? pendingDrift.event : 'none';
+      const driftGrade = pendingDrift ? pendingDrift.grade : 'none';
+      pendingDrift = null;
+      const fb = exitFeedback(driftEvent, driftGrade);
+      if (fb) {
+        exitfbEl.textContent = fb;
+        exitfbEl.classList.add('show');
+        exitFbExpiry = now + 1200;
+        audio.oneShot('cleanExit', 0.5);
+        // One-shot visual surge on the real reward event (bounded, decays).
+        surgeVis = Math.min(1, 0.35 + (sim.rhythm.lastQuality ?? 0) * 0.65);
+      }
+      if (exitFbExpiry && now > exitFbExpiry) { exitfbEl.classList.remove('show'); exitfbEl.textContent = ''; exitFbExpiry = 0; }
+      if (mode === 'practice') {
+        if (recordPracticeExit(practice, driftEvent, driftGrade)) savePractice();
+        lessonEl.textContent = practiceText(practice, coarse);
+      } else if (!lessonSeen) {
+        advanceLesson(lesson, { event: driftEvent, grade: driftGrade, phase: sim.rhythmOut.phase, slideAge: sim.rhythm.slideAge });
+        if (lesson.step === 'complete') { lessonSeen = true; lsSet('canyon-drift-lesson-seen', '1'); lessonEl.textContent = ''; }
+        else lessonEl.textContent = lessonText(lesson.step, coarse);
+      } else {
+        lessonEl.textContent = '';
+      }
+      // Audio: continuous engine/slip layers plus physical one-shots from edges.
+      audio.update(dt, {
+        speed: info.spd, maxSpeed: SPEED_FULL,
+        load: info.offroad ? 0.8 : Math.min(1, sim.driftAmt),
+        slip: Math.min(1, sim.driftAmt),
+        drifting: info.drifting, grounded: sim.grounded,
+      });
+      if (fresh) {
+        if (fresh.wallHit === true) audio.oneShot('crash', clamp(fresh.wallSev ?? 0.5, 0.2, 1));
+        else if (fresh.landed) audio.oneShot('land', clamp(Math.abs(fresh.landV) / 12, 0.2, 1));
+      }
+      if (info.stuckMs > 1500) msgEl.textContent = stuckPrompt(coarse);
+      else if (info.oobMs > 900) msgEl.textContent = offCoursePrompt(coarse);
+      else if (info.offroad && sim.grounded && info.spd > 12) msgEl.textContent = 'LOW GRIP — DIRT';
       else if (info.drifting) msgEl.textContent = 'DRIFT';
-      else if (msgEl.textContent === 'DRIFT' || msgEl.textContent.startsWith('STUCK') || msgEl.textContent.startsWith('OFF COURSE')) msgEl.textContent = '';
+      else if (msgEl.textContent === 'DRIFT' || msgEl.textContent.startsWith('STUCK') || msgEl.textContent.startsWith('OFF COURSE') || msgEl.textContent === 'LOW GRIP — DIRT') msgEl.textContent = '';
       // ghost playback: interpolated, holds finish pose (never loops)
       if (sharedGhost && sharedGhost.p.length > 1) {
         const gp = sampleGhost(sharedGhost, ghostMs);
@@ -848,11 +1319,21 @@ function frame(now: number) {
       car.position.set(rp.x, rp.y, rp.z);
       wallKick *= Math.exp(-5 * dt);
       if (wallKick < 0.001) wallKick = 0;
+      surgeVis *= Math.exp(-4.5 * dt);
+      if (surgeVis < 0.001) surgeVis = 0;
       const shudder = wallKick > 0 ? Math.sin(now * 0.09) * 0.18 * wallKick : 0;
-      car.rotation.set(rp.pitch, rp.h, -input.steer * (0.05 + motion.driftMix * 0.09) + shudder);
+      // Visual-only body exaggeration: extra yaw exposes the real slide angle
+      // (bounded) and the clean-exit surge reads as a short nose-up/roll kick.
+      const slipVis = clamp(info.slip, -0.9, 0.9);
+      const yawVis = -slipVis * (0.15 + 0.35 * motion.driftMix);
+      car.rotation.set(
+        rp.pitch - surgeVis * 0.05,
+        rp.h + yawVis,
+        -input.steer * (0.06 + motion.driftMix * 0.16) - surgeVis * 0.07 + shudder,
+      );
       const tail = car.userData.tail as THREE.MeshBasicMaterial | undefined;
       if (tail) tail.color.setHex(motion.driftMix > 0.4 || input.drift ? 0xff5a2a : 0xff2a2a);
-      const groundY = track.y[info.sIdx] + 0.2;
+      const groundY = surfaceYAt(info.sIdx, rp.x, rp.z) + 0.2;
       blob.position.set(rp.x, groundY + 0.06, rp.z);
       blob.scale.setScalar(1 + clamp(rp.y - groundY, 0, 12) * 0.04);
       // deterministic chase camera (./render-motion.ts): lagged velocity-led
@@ -891,7 +1372,7 @@ function frame(now: number) {
     // dust anim (preallocated ring: decay + rise, dead slots parked at y=-100)
     visuals.update(dt);
     dustGeo.attributes.position.needsUpdate = true;
-    renderer.render(scene, camera);
+    renderScene();
   }
 }
 requestAnimationFrame(frame);

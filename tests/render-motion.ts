@@ -1,11 +1,14 @@
 // Standalone tests for src/render-motion.ts. Synthetic pose streams only:
-// no sim.ts, no THREE, no DOM, no wall-clock, no network.
+// no THREE, no DOM, no wall-clock, no network. Imports the exported physics
+// speed constants (pure modules) to prove the FOV normalization tracks them.
 declare const process: { exit(c: number): void };
 import {
-  DEFAULT_TUNING, cameraHeadingTarget, createMotionState, fovTarget,
-  impulseLength, resetMotion, updateMotion, wrapPi,
+  DEFAULT_TUNING, SPEED_FULL, cameraHeadingTarget, createMotionState, fovTarget,
+  impulseLength, resetMotion, updateMotion, wrapPi, clamp,
 } from '../src/render-motion.js';
 import type { MotionInput, MotionState } from '../src/render-motion.js';
+import { MAX_GRIP_SPEED } from '../src/sim.js';
+import { BOOST_SPEED_CAP } from '../src/drift-control.js';
 
 let pass = 0, fail = 0;
 function ok(cond: boolean, name: string, detail = '') {
@@ -244,21 +247,26 @@ for (const rate of [60, 90, 120, 144]) {
 }
 
 // 13. FOV: smooth drift kick, converges to speed + drift target.
+// Expected values derive from DEFAULT_TUNING/SPEED_FULL, never a hard-coded 80,
+// so the test follows the tuned physics envelope automatically.
 {
   const m = createMotionState();
   const dt = 1 / 60;
   let t = 0;
   let maxStep = 0;
-  for (let i = 0; i < 120; i++) { t += dt; updateMotion(m, T, straightInput(t, 80, { dt, drifting: true })); }
+  const speed = SPEED_FULL * 0.625;
+  const speedFovAt = (v: number) => T.baseFov + clamp(v / T.fullSpeed, 0, 1) * T.speedFov;
+  for (let i = 0; i < 120; i++) { t += dt; updateMotion(m, T, straightInput(t, speed, { dt, drifting: true })); }
   for (let i = 0; i < 240; i++) {
     const prev = m.fov;
     t += dt;
-    updateMotion(m, T, straightInput(t, 80, { dt, drifting: i > 60 ? false : true }));
+    updateMotion(m, T, straightInput(t, speed, { dt, drifting: i > 60 ? false : true }));
     maxStep = Math.max(maxStep, Math.abs(m.fov - prev));
   }
-  ok(Math.abs(m.fov - (62 + 14)) < 0.5, 'fov settles to speed target after drift', `fov=${m.fov.toFixed(2)}`);
+  ok(Math.abs(m.fov - speedFovAt(speed)) < 0.5, 'fov settles to speed target after drift', `fov=${m.fov.toFixed(2)}`);
   ok(maxStep < 0.6, 'no fov step on drift toggle', `maxStep=${maxStep.toFixed(3)}`);
-  ok(Math.abs(fovTarget(T, 80, 1) - 81) < 1e-9 && Math.abs(fovTarget(T, 0, 0) - 62) < 1e-9, 'fov target endpoints');
+  ok(Math.abs(fovTarget(T, T.fullSpeed, 0) - (T.baseFov + T.speedFov)) < 1e-9
+    && Math.abs(fovTarget(T, 0, 0) - T.baseFov) < 1e-9, 'fov target endpoints');
 }
 
 // 14. Low-speed tangent stabilization: camera ignores noisy body yaw when crawling.
@@ -281,6 +289,54 @@ for (const rate of [60, 90, 120, 144]) {
     updateMotion(m, T, straightInput(t, 0.3, { dt, heading: 1.0, vx: 0, vz: 0.3, speed: 0.3 }));
   }
   ok(Math.abs(wrapPi(m.camH)) < 0.1, 'near-stop locks tangent', `camH=${m.camH.toFixed(3)}`);
+}
+
+// 15. Speed camera: normalized to the REAL physics envelope (no stale 80),
+// with a stronger bounded speed-FOV range and a lower/closer chase camera.
+{
+  ok(SPEED_FULL === Math.max(MAX_GRIP_SPEED, BOOST_SPEED_CAP),
+    'SPEED_FULL tracks the exported physics envelope', `${SPEED_FULL} vs ${MAX_GRIP_SPEED}/${BOOST_SPEED_CAP}`);
+  ok(T.fullSpeed === SPEED_FULL, 'tuning fullSpeed uses the physics envelope', `${T.fullSpeed}`);
+  ok(SPEED_FULL > 80, 'envelope moved past the old stale 80 normalization', `${SPEED_FULL}`);
+  const half = SPEED_FULL * 0.5, full = SPEED_FULL;
+  const f0 = fovTarget(T, 0, 0), fHalf = fovTarget(T, half, 0), fFull = fovTarget(T, full, 0);
+  ok(f0 < fHalf && fHalf < fFull, 'fov target monotonic in speed');
+  ok(Math.abs(fovTarget(T, full * 1.5, 0) - fFull) < 1e-9, 'fov saturates at fullSpeed');
+  ok(Math.abs(fHalf - (T.baseFov + T.speedFov * 0.5)) < 1e-9, 'half envelope = half the FOV ramp');
+  ok(T.speedFov >= 2 * 14, 'speed FOV stronger than the old 14-degree ramp', `${T.speedFov}`);
+  ok(T.camDist < 11.5 && T.camHeight < 4.6, 'chase camera is lower and closer than before', `${T.camDist}/${T.camHeight}`);
+  ok(T.lookAhead > 9, 'sightline pushed further ahead', `${T.lookAhead}`);
+  ok(T.baseFov + T.speedFov + T.driftFov <= 100, 'FOV range stays bounded (no fisheye/strobe)', `${T.baseFov + T.speedFov + T.driftFov}`);
+  const settle = (speed: number, rate: number) => {
+    const m = createMotionState();
+    const dt = 1 / rate;
+    let t = 0;
+    for (let i = 0; i < rate * 4; i++) { t += dt; updateMotion(m, T, straightInput(t, speed, { dt })); }
+    return m.fov;
+  };
+  const expected = (speed: number) => T.baseFov + clamp(speed / T.fullSpeed, 0, 1) * T.speedFov;
+  ok(Math.abs(settle(full * 0.5, 60) - expected(full * 0.5)) < 0.5, 'settled fov at half envelope');
+  ok(Math.abs(settle(full, 60) - expected(full)) < 0.5, 'settled fov at full envelope');
+  ok(Math.abs(settle(full * 0.8, 60) - settle(full * 0.8, 144)) < 0.3, 'fov refresh-rate consistent');
+}
+{
+  const m = createMotionState();
+  const dt = 1 / 60;
+  let t = 0;
+  let maxStep = 0;
+  const speed = SPEED_FULL * 0.5;
+  for (let i = 0; i < 120; i++) { t += dt; updateMotion(m, T, straightInput(t, speed, { dt, drifting: true })); }
+  for (let i = 0; i < 240; i++) {
+    const prev = m.fov;
+    t += dt;
+    updateMotion(m, T, straightInput(t, speed, { dt, drifting: i > 60 ? false : true }));
+    maxStep = Math.max(maxStep, Math.abs(m.fov - prev));
+  }
+  const target = T.baseFov + clamp(speed / T.fullSpeed, 0, 1) * T.speedFov;
+  ok(Math.abs(m.fov - target) < 0.5, 'drift exit settles to speed target');
+  ok(maxStep < 0.6, 'no fov step on drift exit');
+  ok(impulseLength(m) === 0, 'speed fov adds no impulse/shake');
+  ok(Math.abs(wrapPi(m.camH)) < 0.2, 'stable framing through drift exit');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

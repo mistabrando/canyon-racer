@@ -25,6 +25,10 @@ import type { BarrierPlan } from './barrier-plan.js';
 export interface Vec3Like { x: number; y: number; z: number }
 export interface CornerEventLike {
   startS: number; endS: number; dir: 'L' | 'R'; medR: number;
+  // Optional plan fields (present on trackgen CornerEvent). `decreasing` marks
+  // the tightening-radius challenge; visuals uses it for the double-chevron
+  // tightening indicator. Absent on minimal headless fixtures -> not tight.
+  entryR?: number; exitR?: number; decreasing?: boolean;
 }
 export interface TrackData {
   points: Vec3Like[];
@@ -80,10 +84,28 @@ export const GUARD_TOP_ABOVE_ROAD = 0.85;
 export const BUDGET = {
   MAX_GUARDRAILS: 640,
   MAX_CHEVRONS: 128,
+  MAX_SIGN_ARROWS: 256,
   MAX_TICKS: 260,
   MAX_DUST: 220,
   MAX_NEW_DRAW_CALLS: 5,
   MAX_NEW_TRIS: 12000,
+} as const;
+
+// Directional sign contract. Every chevron board carries a code-native arrow
+// symbol pointing at the actual turn: dir 'L' -> driver-left (-normal),
+// dir 'R' -> driver-right (+normal). The board sits on the turn's OUTSIDE
+// (side), so arrow direction and placement side are independent encodings.
+// A tightening-radius corner (decreasing + short radius) renders a double
+// chevron so it is distinguishable from an ordinary drift arc even without
+// color. Geometry is generated in code from the injected PlaneGeometry kit —
+// no textures, no new constructor dependencies.
+export const SIGN = {
+  BOARD_W: 2.4, BOARD_H: 1.3,
+  ARROW_W: 1.15, ARROW_H: 1.0, ARROW_NOTCH: 0.42,
+  TIGHT_MED_R: 62,
+  SEVERE_MED_R: 130,
+  DOUBLE_GAP: 0.5,
+  FACE_OFFSET: 0.05,
 } as const;
 
 // ---------- arc-distance helpers (pure) ----------
@@ -163,7 +185,19 @@ export function planSpeedTicks(cum: number[], o: ResolvedOptions): number[] {
   return out;
 }
 
-export interface Chevron { s: number; side: number; severe: boolean }
+export interface Chevron {
+  s: number;
+  // Which side of the road the board stands on (outside of the turn): +1 is
+  // driver-right under n = (-tz, tx). Placement only; see `dir`.
+  side: number;
+  // Actual turn direction from the track event ('L' left, 'R' right). This is
+  // what the arrow symbol points at and is deliberately independent of `side`.
+  dir: 'L' | 'R';
+  // Warning tint: medium-radius or tighter.
+  severe: boolean;
+  // Tightening-radius challenge: decreasing radius below SIGN.TIGHT_MED_R.
+  tight: boolean;
+}
 
 export function planChevrons(
   cum: number[],
@@ -178,17 +212,42 @@ export function planChevrons(
     // Outside of the corner: +normal side is driver-right under the sim
     // normal convention n = (-tz, tx); a left turn's outside is driver-right.
     const side = e.dir === 'L' ? 1 : -1;
-    const severe = e.medR <= 130;
+    // Encode the REAL event direction, robustly, as its own axis. A malformed
+    // runtime value (anything not 'L') is treated as a right turn rather than
+    // silently inheriting placement.
+    const dir: 'L' | 'R' = e.dir === 'L' ? 'L' : 'R';
+    const severe = e.medR <= SIGN.SEVERE_MED_R;
+    const tight = e.decreasing === true && e.medR < SIGN.TIGHT_MED_R;
     for (const back of o.chevronAdvance) {
       const s = e.startS - back;
-      if (s > 10 && s < total - 10) out.push({ s, side, severe });
+      if (s > 10 && s < total - 10) out.push({ s, side, dir, severe, tight });
     }
     for (let s = e.startS + 10; s < e.endS - 5; s += o.chevronRepeater) {
-      out.push({ s, side, severe });
+      out.push({ s, side, dir, severe, tight });
     }
   }
   out.sort((a, b) => a.s - b.s);
   if (out.length > BUDGET.MAX_CHEVRONS) out.length = BUDGET.MAX_CHEVRONS;
+  return out;
+}
+
+// Arrow symbol lateral sign in the road-normal convention: +1 points
+// driver-right, -1 points driver-left. This is the arrow's actual pointing
+// direction and is the opposite of the board's placement side.
+export function arrowPointSign(c: Chevron): number {
+  return c.dir === 'R' ? 1 : -1;
+}
+
+// One to two arrow symbols per board: a single chevron for a normal turn and
+// a double chevron (second symbol offset toward the turn) for tightening.
+export interface SignArrow { chevron: Chevron; offset: number }
+
+export function planSignArrows(chevs: Chevron[]): SignArrow[] {
+  const out: SignArrow[] = [];
+  for (const c of chevs) {
+    out.push({ chevron: c, offset: 0 });
+    if (c.tight) out.push({ chevron: c, offset: arrowPointSign(c) * SIGN.DOUBLE_GAP });
+  }
   return out;
 }
 
@@ -197,6 +256,7 @@ export function planChevrons(
 export interface InstanceCounts {
   guardrails: number;
   chevrons: number;
+  signArrows: number;
   ticks: number;
   dust: number;
 }
@@ -206,35 +266,41 @@ export function countInstances(
   events: CornerEventLike[],
   o: ResolvedOptions,
 ): InstanceCounts {
-  if (cum.length < 2) return { guardrails: 0, chevrons: 0, ticks: 0, dust: 0 };
+  if (cum.length < 2) return { guardrails: 0, chevrons: 0, signArrows: 0, ticks: 0, dust: 0 };
+  const chevrons = planChevrons(cum, events, o);
   return {
     guardrails: planGuardrails(cum, o).idx.length,
-    chevrons: planChevrons(cum, events, o).length,
+    chevrons: chevrons.length,
+    signArrows: planSignArrows(chevrons).length,
     ticks: planSpeedTicks(cum, o).length * 2,
     dust: Math.min(o.dustN, BUDGET.MAX_DUST),
   };
 }
 
 // New draw calls added by mountVisuals: one InstancedMesh per family
-// (guardrails, chevrons, ticks) plus one Points cloud when dust is mounted.
+// (guardrails, chevron boards, directional arrows, ticks) plus one Points
+// cloud when dust is mounted.
 export function estimateDrawCalls(c: InstanceCounts): number {
   let n = 0;
   if (c.guardrails > 0) n++;
   if (c.chevrons > 0) n++;
+  if (c.signArrows > 0) n++;
   if (c.ticks > 0) n++;
   if (c.dust > 0) n++;
   return n;
 }
 
-// guardrail box = 12 tris, tick quad = 2, chevron quad = 2, dust points = 0.
+// guardrail box = 12 tris, tick quad = 2, board quad = 2, arrow chevron = 2
+// (two triangles), dust points = 0.
 export function estimateTriangles(c: InstanceCounts): number {
-  return c.guardrails * 12 + c.ticks * 2 + c.chevrons * 2;
+  return c.guardrails * 12 + c.ticks * 2 + c.chevrons * 2 + c.signArrows * 2;
 }
 
 export function withinBudget(c: InstanceCounts): boolean {
   return (
     c.guardrails <= BUDGET.MAX_GUARDRAILS &&
     c.chevrons <= BUDGET.MAX_CHEVRONS &&
+    c.signArrows <= BUDGET.MAX_SIGN_ARROWS &&
     c.ticks <= BUDGET.MAX_TICKS &&
     c.dust <= BUDGET.MAX_DUST &&
     estimateDrawCalls(c) <= BUDGET.MAX_NEW_DRAW_CALLS &&
@@ -380,25 +446,51 @@ export interface VisualsHandle {
 
 // Shared geometry/material cache: one set per THREE namespace + quality tier.
 interface CacheEntry {
-  guardGeo: unknown; chevGeo: unknown; tickGeo: unknown;
-  guardMat: unknown; chevMat: unknown; tickMat: unknown;
+  guardGeo: unknown; boardGeo: unknown; arrowGeo: unknown; tickGeo: unknown;
+  guardMat: unknown; boardMat: unknown; arrowMat: unknown; tickMat: unknown;
 }
 const cache = new WeakMap<object, { desk: CacheEntry; mob: CacheEntry }>();
+
+// Build a right-pointing chevron arrow from the injected PlaneGeometry. A
+// 1x1 plane has four vertices in the order [TL, TR, BL, BR] with index pairs
+// (0,2,1) and (2,3,1); folding those four corners into the concave-back
+// chevron below yields a solid two-triangle directional arrow with no extra
+// constructor dependency. Guarded so a minimal/stub kit without a writable
+// position attribute simply keeps the plane (no crash headless).
+function buildArrowGeo(kit: ThreeKit): unknown {
+  const geo = new kit.PlaneGeometry(SIGN.ARROW_W, SIGN.ARROW_H) as THREE.BufferGeometry;
+  const attr = typeof geo.getAttribute === 'function'
+    ? geo.getAttribute('position') as THREE.BufferAttribute | undefined
+    : undefined;
+  if (!attr || attr.count < 4 || typeof attr.setX !== 'function') return geo;
+  const w = SIGN.ARROW_W, h = SIGN.ARROW_H, notch = SIGN.ARROW_NOTCH;
+  // v0 top-left outer, v1 right apex, v2 inner notch, v3 bottom-left outer.
+  attr.setX(0, -w / 2); attr.setY(0, h / 2);
+  attr.setX(1, w / 2); attr.setY(1, 0);
+  attr.setX(2, -w / 2 + notch); attr.setY(2, 0);
+  attr.setX(3, -w / 2); attr.setY(3, -h / 2);
+  attr.needsUpdate = true;
+  if (typeof geo.computeBoundingSphere === 'function') geo.computeBoundingSphere();
+  return geo;
+}
 
 function entryFor(kit: ThreeKit, mobile: boolean): CacheEntry {
   let tiers = cache.get(kit);
   if (!tiers) {
     const mk = (mob: boolean): CacheEntry => {
       const guardGeo = new kit.BoxGeometry(1, 1, 1);
-      const chevGeo = new kit.PlaneGeometry(2.4, 1.3);
+      const boardGeo = new kit.PlaneGeometry(SIGN.BOARD_W, SIGN.BOARD_H);
+      const arrowGeo = buildArrowGeo(kit);
       const tickGeo = new kit.PlaneGeometry(1.4, 0.5);
       tickGeo.rotateX(-Math.PI / 2);
       const guardMat = new kit.MeshLambertMaterial({ color: 0xffffff });
-      const chevMat = new kit.MeshBasicMaterial({ color: 0xffffff, side: kit.DoubleSide });
+      const boardMat = new kit.MeshBasicMaterial({ color: 0xffffff, side: kit.DoubleSide });
+      // Near-black symbol: maximum contrast against the amber/red board.
+      const arrowMat = new kit.MeshBasicMaterial({ color: 0x101010, side: kit.DoubleSide });
       const tickMat = new kit.MeshBasicMaterial({
         color: 0xf5efdd, transparent: true, opacity: mob ? 0.55 : 0.8,
       });
-      return { guardGeo, chevGeo, tickGeo, guardMat, chevMat, tickMat };
+      return { guardGeo, boardGeo, arrowGeo, tickGeo, guardMat, boardMat, arrowMat, tickMat };
     };
     tiers = { desk: mk(false), mob: mk(true) };
     cache.set(kit, tiers);
@@ -434,7 +526,8 @@ export function mountVisuals(
 
   const disposables: THREE.InstancedMesh[] = [];
   let guardMesh: THREE.InstancedMesh | null = null;
-  let chevMesh: THREE.InstancedMesh | null = null;
+  let boardMesh: THREE.InstancedMesh | null = null;
+  let arrowMesh: THREE.InstancedMesh | null = null;
   let tickMesh: THREE.InstancedMesh | null = null;
 
   const g = planGuardrails(track.cum, o);
@@ -489,9 +582,9 @@ export function mountVisuals(
 
   const chevs = planChevrons(track.cum, events, o);
   if (chevs.length > 0) {
-    chevMesh = new kit.InstancedMesh(
-      A.chevGeo as THREE.BufferGeometry,
-      A.chevMat as THREE.Material,
+    boardMesh = new kit.InstancedMesh(
+      A.boardGeo as THREE.BufferGeometry,
+      A.boardMat as THREE.Material,
       chevs.length,
     );
     for (let k = 0; k < chevs.length; k++) {
@@ -508,13 +601,51 @@ export function mountVisuals(
       );
       sv.set(1, 1, 1);
       m.compose(v, q, sv);
-      chevMesh.setMatrixAt(k, m);
-      chevMesh.setColorAt(k, col.set(chevs[k].severe ? 0xd83a2a : 0xf2a53a));
+      boardMesh.setMatrixAt(k, m);
+      // Deep red for the tightening challenge, warning red for a tight drift
+      // arc, amber for everything else.
+      const tint = chevs[k].tight ? 0xd11a0f : chevs[k].severe ? 0xd83a2a : 0xf2a53a;
+      boardMesh.setColorAt(k, col.set(tint));
     }
-    chevMesh.instanceMatrix.needsUpdate = true;
-    if (chevMesh.instanceColor) chevMesh.instanceColor.needsUpdate = true;
-    group.add(chevMesh);
-    disposables.push(chevMesh);
+    boardMesh.instanceMatrix.needsUpdate = true;
+    if (boardMesh.instanceColor) boardMesh.instanceColor.needsUpdate = true;
+    group.add(boardMesh);
+    disposables.push(boardMesh);
+
+    // Directional symbols, one instanced draw call for all chevrons. The
+    // arrow points at the actual event.dir: dir 'R' -> driver-right (+normal),
+    // 'L' -> driver-left (-normal), mirrored via a negative local-X scale.
+    // Tightening signs add a second symbol offset toward the turn (double
+    // chevron). A small offset along the board face hides the coplanar symbol.
+    const arrows = planSignArrows(chevs);
+    if (arrows.length > 0) {
+      arrowMesh = new kit.InstancedMesh(
+        A.arrowGeo as THREE.BufferGeometry,
+        A.arrowMat as THREE.Material,
+        arrows.length,
+      );
+      for (let k = 0; k < arrows.length; k++) {
+        const ar = arrows[k];
+        const i = indexAtS(track.cum, ar.chevron.s);
+        const p = track.points[i];
+        const nrm = track.normals[i];
+        const off = ar.chevron.side * (o.halfW + 4.5);
+        const tan = track.tangents[i];
+        eu.set(0, yawAt(i) + Math.PI, 0);
+        q.setFromEuler(eu);
+        v.set(
+          p.x + nrm.x * (off + ar.offset) - tan.x * SIGN.FACE_OFFSET,
+          p.y + 1.5,
+          p.z + nrm.z * (off + ar.offset) - tan.z * SIGN.FACE_OFFSET,
+        );
+        sv.set(arrowPointSign(ar.chevron), 1, 1);
+        m.compose(v, q, sv);
+        arrowMesh.setMatrixAt(k, m);
+      }
+      arrowMesh.instanceMatrix.needsUpdate = true;
+      group.add(arrowMesh);
+      disposables.push(arrowMesh);
+    }
   }
 
   const stations = planSpeedTicks(track.cum, o);
@@ -554,11 +685,13 @@ export function mountVisuals(
     counts,
     dust,
     setQuality(mobile: boolean): void {
-      // Mobile degradation: drop the noisiest families first, keep chevrons
-      // (corner readability) until last. Visibility toggles only.
+      // Mobile degradation: drop the noisiest families first, keep the
+      // directional boards + arrows (corner readability) until last.
+      // Visibility toggles only.
       if (tickMesh) tickMesh.visible = !mobile;
       if (guardMesh) guardMesh.visible = true;
-      if (chevMesh) chevMesh.visible = true;
+      if (boardMesh) boardMesh.visible = true;
+      if (arrowMesh) arrowMesh.visible = true;
     },
     update(dt: number): void {
       dust.update(dt);

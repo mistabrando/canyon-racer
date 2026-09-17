@@ -32,11 +32,13 @@ export const GHOST_LEGACY_VERSION = 1;
 export const GHOST_IDENTITY_VERSION = 3;
 /**
  * Identity-aware generation. Bump when trackgen changes anything that moves
- * the road (width, grammar, elevation, sampling, acceptance): same-day PBs
- * recorded under an older gen must fail closed even if a checksum collides.
+ * the road (width, grammar, elevation, sampling, acceptance) OR when the
+ * physics/competition pace changes: PBs recorded under an older gen must fail
+ * closed even if a checksum collides. v2 = speed-dirt (faster cruise, dirt,
+ * retuned grammar), so v1 ghosts/PBs never race the new competition.
  * Legacy payloads (v1/v2/C1, no identity) predate all gens.
  */
-export const TRACK_IDENTITY_GEN = 1;
+export const TRACK_IDENTITY_GEN = 2;
 export const GHOST_REC_CADENCE_MS = 120;
 export const GHOST_MAX_SAMPLES = 4000;
 export const GHOST_MIN_SAMPLES = 2;

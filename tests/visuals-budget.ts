@@ -1,14 +1,20 @@
 // Headless budget tests for src/visuals.ts + src/environment.ts. Runs under
 // plain node (no deps: neither module has a runtime three import; constructor
 // kits are injected). Also enrolled in tsconfig.tests.json; during parallel
-// worker activity verify via a /tmp compile instead of the shared build.
+// worker activity verify via a project-relative compile instead of the shared
+// build, e.g. tsc -p tsconfig.tests.json --outDir .muse/test-output/signs.
 declare const process: { exit(c: number): void };
 import {
-  BUDGET, DustRing, GUARD_TOP_ABOVE_ROAD, countInstances, estimateDrawCalls,
-  estimateTriangles, indexAtS, planChevrons, planGuardrails, planSpeedTicks,
-  resolveOptions, withinBudget,
+  BUDGET, DustRing, GUARD_TOP_ABOVE_ROAD, SIGN, arrowPointSign, countInstances,
+  estimateDrawCalls, estimateTriangles, indexAtS, mountVisuals, planChevrons,
+  planGuardrails, planSignArrows, planSpeedTicks, resolveOptions, withinBudget,
 } from '../src/visuals.js';
-import type { CornerEventLike, TrackData, Vec3Like } from '../src/visuals.js';
+import type {
+  CornerEventLike, ThreeKit, TrackData, Vec3Like,
+} from '../src/visuals.js';
+import { acceptDailyTrack, arcLengths, TRACK_HALF_W } from '../src/trackgen.js';
+import { trackFromPoints } from '../src/sim.js';
+import { resolveCourse } from '../src/courses.js';
 
 let pass = 0, fail = 0;
 function ok(cond: boolean, name: string, detail = '') {
@@ -44,13 +50,80 @@ function demoEvents(): CornerEventLike[] {
   return ev;
 }
 
+// Straight road with a real elevation profile (y rises with z), so grounding
+// checks cannot pass by accident on a constant-y fixture.
+function hillyTrack(L: number): TrackData {
+  const points: Vec3Like[] = [];
+  const tangents: Vec3Like[] = [];
+  const normals: Vec3Like[] = [];
+  const cum: number[] = [];
+  let s = 0;
+  for (let z = 0; z <= L; z += 2) {
+    points.push({ x: 0, y: 6 + z * 0.005, z });
+    tangents.push({ x: 0, y: 0, z: 1 });
+    normals.push({ x: -1, y: 0, z: 0 });
+    cum.push(s);
+    s += 2;
+  }
+  return { points, tangents, normals, cum };
+}
+
+function nearestIndex(t: TrackData, x: number, z: number): number {
+  let best = Infinity, bi = 0;
+  for (let i = 0; i < t.points.length; i++) {
+    const d = (t.points[i].x - x) ** 2 + (t.points[i].z - z) ** 2;
+    if (d < best) { best = d; bi = i; }
+  }
+  return bi;
+}
+function distToCenterline(t: TrackData, x: number, z: number): number {
+  const i = nearestIndex(t, x, z);
+  return Math.hypot(t.points[i].x - x, t.points[i].z - z);
+}
+function fracOf(t: TrackData, x: number, z: number): number {
+  return t.cum[nearestIndex(t, x, z)] / t.cum[t.cum.length - 1];
+}
+
+// Approximate launch chase-cam forward view: camera ~8u behind and 3u above the
+// start, looking down the opening tangent. Returns the maximum elevation (deg)
+// of any solid family's top within a 140-degree forward arc and 350u, i.e. how
+// much of the launch sky is occupied.
+function launchMaxElevation(t: TrackData, r: ReturnType<typeof enforceCorridor>): number {
+  const p0 = t.points[0], tan = t.tangents[0];
+  const cam = { x: p0.x - tan.x * 8, y: p0.y + 3, z: p0.z - tan.z * 8 };
+  let maxElev = 0;
+  const consider = (x: number, z: number, top: number): void => {
+    const dx = x - cam.x, dz = z - cam.z;
+    const hd = Math.hypot(dx, dz);
+    if (hd < 1 || hd > 350) return;
+    const forward = dx * tan.x + dz * tan.z;
+    const side = dx * -tan.z + dz * tan.x;
+    if (Math.abs(Math.atan2(side, forward)) > (70 * Math.PI) / 180) return;
+    maxElev = Math.max(maxElev, Math.atan2(top - cam.y, hd));
+  };
+  for (const layer of [r.walls.near, r.walls.far]) {
+    for (const w of layer) {
+      const p = t.points[w.idx], nrm = t.normals[w.idx];
+      consider(p.x + nrm.x * w.side * w.lateral, p.z + nrm.z * w.side * w.lateral, p.y - 10 + w.h);
+    }
+  }
+  for (const m of r.mesas) consider(m.x, m.z, m.y + m.h);
+  for (const a of r.arches) {
+    const p = t.points[a.idx], nrm = t.normals[a.idx];
+    consider(p.x + nrm.x * a.side * a.lateral, p.z + nrm.z * a.side * a.lateral,
+      archCenterY(p.y, a.r) + archHalfHeight(a.r));
+  }
+  return (maxElev * 180) / Math.PI;
+}
+
 // 1. Nominal daily-length track fits the budget on desktop + mobile.
 {
   const t = straightTrack(2252);
   const ev = demoEvents();
   const c = countInstances(t.cum, ev, resolveOptions({}));
   ok(withinBudget(c), 'desktop counts within budget', JSON.stringify(c));
-  ok(estimateDrawCalls(c) <= 4, 'at most 4 new draw calls', `draws=${estimateDrawCalls(c)}`);
+  ok(c.signArrows >= c.chevrons, 'every board carries at least one arrow', `${c.signArrows}/${c.chevrons}`);
+  ok(estimateDrawCalls(c) <= BUDGET.MAX_NEW_DRAW_CALLS, 'draw calls under budget cap', `draws=${estimateDrawCalls(c)}`);
   ok(estimateTriangles(c) <= BUDGET.MAX_NEW_TRIS, 'tris under cap', `tris=${estimateTriangles(c)}`);
   const m = countInstances(t.cum, ev, resolveOptions({ mobile: true }));
   ok(withinBudget(m), 'mobile counts within budget', JSON.stringify(m));
@@ -83,11 +156,19 @@ function demoEvents(): CornerEventLike[] {
   const first = ch.filter((c) => c.s < 200);
   ok(first.length === 3, 'advance boards precede entry', `n=${first.length}`);
   ok(first.every((c) => c.side === 1), 'L-corner boards on outside (+1)');
+  // dir is the real turn direction: a left turn's board sits on the driver's
+  // right but its arrow still points left. side and dir are independent.
+  ok(first.every((c) => c.dir === 'L'), 'L-corner boards encode real dir L');
+  ok(first.every((c) => arrowPointSign(c) === -1), 'L-corner arrows point driver-left');
   const rCorner = ch.filter((c) => c.s > 400 && c.s < 560);
   ok(rCorner.every((c) => c.side === -1), 'R-corner boards on outside (-1)');
+  ok(rCorner.every((c) => c.dir === 'R'), 'R-corner boards encode real dir R');
+  ok(rCorner.every((c) => arrowPointSign(c) === 1), 'R-corner arrows point driver-right');
   ok(rCorner.some((c) => c.severe), 'drift corner flagged severe');
+  ok(rCorner.every((c) => !c.tight), 'no decreasing flag -> not tightening');
   const sweeper = ch.filter((c) => c.s < 200);
   ok(sweeper.every((c) => !c.severe), 'sweeper flagged non-severe');
+  ok(sweeper.every((c) => !c.tight), 'sweeper not flagged tightening');
 }
 
 // 4. Caps hold under adversarial input.
@@ -100,18 +181,20 @@ function demoEvents(): CornerEventLike[] {
   const o = resolveOptions({});
   const c = countInstances(t.cum, many, o);
   ok(c.chevrons <= BUDGET.MAX_CHEVRONS, 'chevrons capped', `n=${c.chevrons}`);
+  ok(c.signArrows <= BUDGET.MAX_SIGN_ARROWS, 'sign arrows capped', `n=${c.signArrows}`);
   ok(c.guardrails <= BUDGET.MAX_GUARDRAILS, 'guardrails capped', `n=${c.guardrails}`);
   ok(c.ticks <= BUDGET.MAX_TICKS, 'ticks capped', `n=${c.ticks}`);
   ok(c.dust <= BUDGET.MAX_DUST, 'dust capped', `n=${c.dust}`);
   ok(withinBudget(c), 'capped counts within budget');
   ok(!withinBudget({ ...c, guardrails: 9999 }), 'over-budget detected');
+  ok(!withinBudget({ ...c, signArrows: BUDGET.MAX_SIGN_ARROWS + 1 }), 'arrow over-budget detected');
 }
 
 // 5. Degenerate input yields zero-cost visuals.
 {
   const o = resolveOptions({});
   const c = countInstances([0], [], o);
-  ok(c.guardrails === 0 && c.chevrons === 0 && c.ticks === 0, 'empty track, no instances');
+  ok(c.guardrails === 0 && c.chevrons === 0 && c.signArrows === 0 && c.ticks === 0, 'empty track, no instances');
   ok(estimateDrawCalls(c) === 0, 'empty track, no draw calls');
   ok(planChevrons([0], [], o).length === 0, 'no events, no chevrons');
 }
@@ -161,17 +244,213 @@ function demoEvents(): CornerEventLike[] {
   ok(a === b, 'placements byte-identical across runs');
 }
 
+// 8a. Actual directional signs: the arrow points at the real turn direction,
+// independent of the board's placement side. Validated against the synthetic
+// track's own curvature (tangent derivative), not against the event's `dir`.
+function arcTrack(dir: 'L' | 'R', steps = 200, R = 100, ds = 2): TrackData {
+  const points: Vec3Like[] = [], tangents: Vec3Like[] = [], normals: Vec3Like[] = [], cum: number[] = [];
+  let x = 0, z = 0, s = 0;
+  for (let k = 0; k <= steps; k++) {
+    const yaw = (dir === 'L' ? 1 : -1) * (s / R);
+    points.push({ x, y: 6, z });
+    tangents.push({ x: Math.sin(yaw), y: 0, z: Math.cos(yaw) });
+    normals.push({ x: -Math.cos(yaw), y: 0, z: Math.sin(yaw) });
+    cum.push(s);
+    x += Math.sin(yaw) * ds; z += Math.cos(yaw) * ds; s += ds;
+  }
+  return { points, tangents, normals, cum };
+}
+{
+  for (const dir of ['L', 'R'] as const) {
+    const t = arcTrack(dir);
+    const ev: CornerEventLike[] = [{ startS: 100, endS: 300, dir, medR: 100 }];
+    const ch = planChevrons(t.cum, ev, resolveOptions({}));
+    ok(ch.length > 0 && ch.every((c) => c.dir === dir), `signs encode event dir ${dir}`, `n=${ch.length}`);
+    // Mid-corner sign: derive the true centre-of-curvature direction from the
+    // track geometry (dT/ds points at the circle centre).
+    const c = ch[Math.floor(ch.length / 2)];
+    const i = indexAtS(t.cum, c.s);
+    const cx = t.tangents[i + 1].x - t.tangents[i - 1].x;
+    const cz = t.tangents[i + 1].z - t.tangents[i - 1].z;
+    const clen = Math.hypot(cx, cz);
+    const arrow = { x: t.normals[i].x * arrowPointSign(c), z: t.normals[i].z * arrowPointSign(c) };
+    const place = { x: t.normals[i].x * c.side, z: t.normals[i].z * c.side };
+    const dotArrow = (arrow.x * cx + arrow.z * cz) / clen;
+    const dotPlace = (place.x * cx + place.z * cz) / clen;
+    ok(dotArrow > 0.9, `arrow points into the ${dir} turn`, `dot=${dotArrow.toFixed(3)}`);
+    ok(dotPlace < -0.9, `board stands on the outside of the ${dir} turn`, `dot=${dotPlace.toFixed(3)}`);
+  }
+}
+
+// 8b. Severity + tightening encoding, and the tightening arrow is doubled.
+{
+  const t = straightTrack(1400);
+  const ev: CornerEventLike[] = [
+    { startS: 100, endS: 200, dir: 'L', medR: 145, decreasing: false }, // sweeper
+    { startS: 400, endS: 500, dir: 'R', medR: 110, decreasing: false }, // drift arc
+    { startS: 700, endS: 800, dir: 'R', medR: 100, decreasing: true },  // decreasing but wide
+    { startS: 1000, endS: 1100, dir: 'L', medR: 50, decreasing: true }, // tightening
+  ];
+  const ch = planChevrons(t.cum, ev, resolveOptions({}));
+  const flagged = (s0: number, s1: number) => ch.filter((c) => c.s >= s0 && c.s < s1);
+  const sweeper = flagged(30, 100), drift = flagged(330, 380);
+  const wide = flagged(630, 680), tight = flagged(930, 980);
+  ok(sweeper.length > 0 && sweeper.every((c) => !c.severe && !c.tight), 'sweeper: no warning, no tight');
+  ok(drift.length > 0 && drift.every((c) => c.severe && !c.tight), 'drift arc: severe warning, not tight');
+  ok(wide.length > 0 && wide.every((c) => c.severe && !c.tight), 'decreasing-wide: warning but not tight (radius gate)');
+  ok(tight.length > 0 && tight.every((c) => c.severe && c.tight), 'tightening: severe + tight flag');
+  const allTight = ch.filter((c) => c.tight);
+  ok(allTight.length > 0 && allTight.every((c) => c.dir === 'L'), 'tightening flag follows the event, not side');
+  const arrows = planSignArrows(ch);
+  ok(arrows.length === ch.length + allTight.length, 'tight signs render a double chevron', `${arrows.length} arrows / ${ch.length} signs`);
+  const doublers = arrows.filter((a) => a.chevron.tight);
+  ok(doublers.length === allTight.length * 2, 'each tight sign contributes exactly two symbols');
+  ok(doublers.every((a) => a.offset === 0 || Math.abs(a.offset) === SIGN.DOUBLE_GAP), 'double symbol offset bounded');
+  const offsets = doublers.filter((a) => a.offset !== 0);
+  ok(offsets.every((a) => Math.sign(a.offset) === arrowPointSign(a.chevron)), 'second symbol offsets toward the turn');
+}
+
+// 8c. Directional-sign budgets are honest: 5 draw calls max, arrows capped,
+// triangle estimate includes both symbol triangles.
+{
+  const t = straightTrack(5000);
+  const tightAll: CornerEventLike[] = [];
+  for (let k = 0; k < 60; k++) {
+    tightAll.push({ startS: 50 + k * 80, endS: 120 + k * 80, dir: 'L', medR: 45, decreasing: true });
+  }
+  const o = resolveOptions({});
+  const c = countInstances(t.cum, tightAll, o);
+  ok(c.signArrows <= BUDGET.MAX_SIGN_ARROWS, 'adversarial tight arrows capped', `n=${c.signArrows}`);
+  ok(withinBudget(c), 'capped tight counts within budget', JSON.stringify(c));
+  ok(estimateDrawCalls(c) <= BUDGET.MAX_NEW_DRAW_CALLS, 'signs stay within the draw-call budget', `draws=${estimateDrawCalls(c)}`);
+  const expectedTris = c.guardrails * 12 + c.ticks * 2 + c.chevrons * 2 + c.signArrows * 2;
+  ok(estimateTriangles(c) === expectedTris, 'triangle estimate counts boards + arrow symbols', `tris=${estimateTriangles(c)}`);
+  const noSigns = { ...c, chevrons: 0, signArrows: 0 };
+  ok(estimateDrawCalls(noSigns) === estimateDrawCalls(c) - 2, 'boards + arrows are exactly two draws');
+}
+
+// 8d. Headless fake-kit mount: the injected constructor kit contract still
+// holds — mountVisuals runs without real three, builds the code-native chevron
+// geometry, and mirrors each arrow to its encoded direction.
+{
+  class FakeAttr {
+    data: number[][];
+    needsUpdate = false;
+    constructor(data: number[][]) { this.data = data; }
+    get count(): number { return this.data.length; }
+    getX(i: number): number { return this.data[i][0]; }
+    getY(i: number): number { return this.data[i][1]; }
+    setX(i: number, v: number): void { this.data[i][0] = v; }
+    setY(i: number, v: number): void { this.data[i][1] = v; }
+  }
+  class FakePlane {
+    position: FakeAttr;
+    constructor(w: number, h: number) {
+      const hw = w / 2, hh = h / 2;
+      this.position = new FakeAttr([
+        [-hw, hh, 0], [hw, hh, 0], [-hw, -hh, 0], [hw, -hh, 0],
+      ]);
+    }
+    getAttribute(name: string): FakeAttr | undefined { return name === 'position' ? this.position : undefined; }
+    computeBoundingSphere(): void { /* no-op */ }
+    rotateX(): void { /* no-op */ }
+    dispose(): void { /* no-op */ }
+  }
+  class FakeGeo { dispose(): void { /* no-op */ } }
+  class FakeColor { hex = 0; set(h: number): FakeColor { this.hex = h; return this; } }
+  class FakeMat {
+    color: number; side: number;
+    constructor(o: { color?: number; side?: number } = {}) {
+      this.color = o.color ?? 0xffffff; this.side = o.side ?? 0;
+    }
+    dispose(): void { /* no-op */ }
+  }
+  interface FakeRecord { pos: { x: number; y: number; z: number }; scale: { x: number; y: number; z: number } }
+  class FakeInst {
+    geo: unknown; mat: FakeMat; count: number; visible = true;
+    records: FakeRecord[] = [];
+    colors: number[] = [];
+    instanceMatrix = { needsUpdate: false };
+    instanceColor = { needsUpdate: false };
+    constructor(geo: unknown, mat: FakeMat, count: number) { this.geo = geo; this.mat = mat; this.count = count; }
+    setMatrixAt(i: number, m: { pos: { x: number; y: number; z: number }; scale: { x: number; y: number; z: number } }): void {
+      this.records[i] = { pos: { ...m.pos }, scale: { ...m.scale } };
+    }
+    setColorAt(i: number, c: FakeColor): void { this.colors[i] = c.hex; }
+    dispose(): void { /* no-op */ }
+  }
+  class FakeGroup {
+    name = ''; children: unknown[] = [];
+    add(o: unknown): void { this.children.push(o); }
+    remove(o: unknown): void { const k = this.children.indexOf(o); if (k >= 0) this.children.splice(k, 1); }
+  }
+  class FakeMatrix {
+    pos = { x: 0, y: 0, z: 0 }; scale = { x: 1, y: 1, z: 1 };
+    compose(v: { x: number; y: number; z: number }, _q: unknown, s: { x: number; y: number; z: number }): void {
+      this.pos = { x: v.x, y: v.y, z: v.z };
+      this.scale = { x: s.x, y: s.y, z: s.z };
+    }
+  }
+  class FakeQuat { setFromEuler(): void { /* no-op */ } }
+  class FakeEuler { set(): void { /* no-op */ } }
+  class FakeVec {
+    x: number; y: number; z: number;
+    constructor(x = 0, y = 0, z = 0) { this.x = x; this.y = y; this.z = z; }
+    set(x: number, y: number, z: number): void { this.x = x; this.y = y; this.z = z; }
+  }
+  const fakeKit = {
+    BoxGeometry: FakeGeo, PlaneGeometry: FakePlane,
+    MeshLambertMaterial: FakeMat, MeshBasicMaterial: FakeMat,
+    InstancedMesh: FakeInst, Group: FakeGroup, Matrix4: FakeMatrix,
+    Quaternion: FakeQuat, Euler: FakeEuler, Vector3: FakeVec,
+    Color: FakeColor, DoubleSide: 2,
+  };
+  const t = arcTrack('L', 120);
+  const ev: CornerEventLike[] = [{ startS: 60, endS: 160, dir: 'L', medR: 90, decreasing: true }];
+  const added: unknown[] = [];
+  const scene = { add(o: unknown): void { added.push(o); }, remove(): void { /* no-op */ } };
+  const handle = mountVisuals(
+    fakeKit as unknown as ThreeKit,
+    scene as unknown as Parameters<typeof mountVisuals>[1],
+    { ...t, events: ev }, { halfW: 8 },
+  );
+  const chevs = planChevrons(t.cum, ev, resolveOptions({}));
+  const arrows = planSignArrows(chevs);
+  ok(handle.counts.signArrows === arrows.length, 'fake-kit mount plans the arrows', `${handle.counts.signArrows}`);
+  const group = added[0] as InstanceType<typeof FakeGroup>;
+  const arrowMesh = group.children.find(
+    (o) => o instanceof FakeInst && o.mat.color === 0x101010,
+  ) as InstanceType<typeof FakeInst> | undefined;
+  ok(!!arrowMesh, 'fake-kit mount builds the arrow instanced mesh');
+  if (arrowMesh) {
+    ok(arrowMesh.count === arrows.length, 'arrow instance count matches the planner', `n=${arrowMesh.count}`);
+    let mirrorOk = true;
+    for (let k = 0; k < arrows.length; k++) {
+      if (arrowMesh.records[k].scale.x !== arrowPointSign(arrows[k].chevron)) { mirrorOk = false; break; }
+    }
+    ok(mirrorOk, 'arrow instances mirror to the encoded turn direction');
+    const geo = arrowMesh.geo as InstanceType<typeof FakePlane>;
+    ok(geo.position.getX(1) > geo.position.getX(0), 'arrow geometry has a pointing apex');
+    ok(geo.position.getY(1) === 0 && geo.position.getY(0) > 0, 'arrow geometry is a chevron, not a rectangle');
+  }
+  handle.dispose();
+}
 
 
 // ---------- Cycle 2: environment + sightlines ----------
 
 import {
-  ENV_BUDGET, FAR_GEOMETRY_KIND, FAR_TRIS, FLAT_SHADED, HAZE_COLOR, PIER_TINT, SIGHTLINE,
-  WALL_GEOMETRY_KIND, WALL_TRIS,
-  countEnvInstances, estimateEnvDrawCalls, estimateEnvTriangles,
-  envWithinBudget, gorgeModeAt, isGatePier, hash01, planArches, planMesas, planScrub, planWalls,
-  resolveEnvOptions, ridgeBlockMean, strataColor,
+  EASEIN_LEN, ENV_BASE_DROP, ENV_BUDGET, FAR_GEOMETRY_KIND, FAR_TRIS, FLAT_SHADED, GORGE_BLOCK,
+  GORGE_MAX_CUT_RUN, HAZE_COLOR, HORIZON_CLEAR, LANDMARK_TINT, OPENING_FAR_LATERAL,
+  OPENING_LANDMARK_LATERAL, OPENING_LEN, OPENING_MIN_LATERAL, PIER_TINT, SIGHTLINE,
+  TERRACE_TINT_BASE, WALL_GEOMETRY_KIND, WALL_TRIS, archCenterY, archExtent, archHalfHeight,
+  corridorNeed, openingLateral,
+  countEnvInstances, enforceCorridor, estimateEnvDrawCalls, estimateEnvTriangles,
+  envWithinBudget, gorgeModeAt, isGatePier, hash01, mesaDepth, planArches, planMesas,
+  planScrub, planWalls, resolveEnvOptions, ridgeBlockMean, strataColor, groundPlainBounds,
+  GROUND_PLAIN_MIN_SIZE, GROUND_PLAIN_SNAP, groundPlainCovers,
 } from '../src/environment.js';
+import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.js';
 
 // 9. Guardrail sightline contract (visuals.ts).
 {
@@ -200,7 +479,9 @@ import {
   const o = resolveEnvOptions({});
   const w = planWalls(t.cum, ev, o);
   const total = w.near.length + w.far.length;
-  ok(total > 300 && total <= ENV_BUDGET.MAX_WALLS, 'wall volume in budget', `n=${total}`);
+  // Far range is one-sided by design now, so total volume is lower but still
+  // substantial; the cap is unchanged.
+  ok(total > 200 && total <= ENV_BUDGET.MAX_WALLS, 'wall volume in budget', `n=${total}`);
   ok(w.far.length > 0 && w.near.length > w.far.length, 'two depth layers, near dominant');
   let clear = true;
   for (const s of w.near) {
@@ -230,7 +511,8 @@ import {
 {
   const t = straightTrack(2252);
   const mesas = planMesas(t);
-  ok(mesas.length === 20, 'mid + horizon + spire + gate-pier set', `n=${mesas.length}`);
+  ok(mesas.length >= 24 && mesas.length <= ENV_BUDGET.MAX_MESAS,
+    'mid + terraces + horizon + spires + landmark + piers', `n=${mesas.length}`);
   const far = mesas.filter((m) => m.haze > 0);
   ok(far.length === 8 && far.every((m) => m.haze === 0.55), 'hazed horizon ring');
   ok(far.every((m) => Math.hypot(m.x, m.z) > 300), 'buttes sit at horizon depth');
@@ -251,6 +533,20 @@ import {
   ok(sc.length > 100 && sc.length <= ENV_BUDGET.MAX_SCRUB, 'scrub volume in budget', `n=${sc.length}`);
   ok(sc.every((s) => s.lateral >= 11.5 && s.lateral <= 16), 'scrub hugs road edge');
   ok(sc.every((s) => s.h <= SIGHTLINE.MAX_SCRUB_H), 'scrub never blocks sightlines');
+  // Sparse, varied vegetation: no uniform fence. Heights/widths vary and some
+  // stations are deliberately skipped, while clusters keep enough cover.
+  const hr = Math.max(...sc.map((s) => s.h)) - Math.min(...sc.map((s) => s.h));
+  const wr = Math.max(...sc.map((s) => s.w)) - Math.min(...sc.map((s) => s.w));
+  ok(hr > 0.6 && wr > 0.8, 'scrub silhouette varies (not one shrub)', `h=${hr.toFixed(2)} w=${wr.toFixed(2)}`);
+  const stations = new Set(sc.map((s) => s.idx)).size;
+  let visits = 0, next = o.scrubStep;
+  for (let i = 1; i < t.cum.length - 1 && next < t.cum[t.cum.length - 1] - 8; i++) {
+    if (t.cum[i] < next) continue;
+    next = t.cum[i] + o.scrubStep; visits++;
+  }
+  ok(visits - stations >= 3, 'gaps break the repeating fence', `${stations}/${visits} stations placed`);
+  const clustered = sc.filter((s, k) => k > 0 && s.idx === sc[k - 1].idx && s.side === sc[k - 1].side).length;
+  ok(clustered > 0, 'clustered plants exist', `n=${clustered}`);
 }
 
 // 15. Environment budget: draws, tris, mobile reduction, determinism.
@@ -280,7 +576,7 @@ import {
   const e = countEnvInstances(t, ev, resolveEnvOptions({}));
   const draws = estimateDrawCalls(v) + estimateEnvDrawCalls(e);
   const tris = estimateTriangles(v) + estimateEnvTriangles(e);
-  ok(draws <= 9, 'combined new draw calls bounded', `draws=${draws}`);
+  ok(draws <= 10, 'combined new draw calls bounded', `draws=${draws}`);
   ok(tris <= 40000, 'combined new tris bounded', `tris=${tris}`);
   console.log(`    [measure] visuals=${JSON.stringify(v)} env=${JSON.stringify(e)} draws=${draws} tris=${tris}`);
 }
@@ -315,21 +611,25 @@ import {
   for (let k = 0; k < 200; k++) modes.push(gorgeModeAt(k));
   const vistas = modes.filter((m) => m === 'vista').length;
   const ratio = vistas / modes.length;
-  ok(ratio >= 0.2 && ratio <= 0.5, 'open-vista share breathes, never a corridor', `vista=${ratio.toFixed(2)}`);
+  ok(ratio >= 0.3 && ratio <= 0.65, 'open-vista share breathes, never a corridor', `vista=${ratio.toFixed(2)}`);
   ok(modes.includes('cut'), 'enclosed cuts still exist');
+  ok(gorgeModeAt(0) === 'vista', 'launch approach opens out (no slab corridor)');
   ok(gorgeModeAt(7) === gorgeModeAt(7) && gorgeModeAt(199) === gorgeModeAt(199), 'gorge rhythm deterministic');
-  // Block granularity: mode is constant within a 3-station block.
+  // Block granularity: mode is constant within one GORGE_BLOCK phrase.
   let blocky = true;
   for (let b = 0; b < 60; b++) {
-    const m = gorgeModeAt(b * 3);
-    if (gorgeModeAt(b * 3 + 1) !== m || gorgeModeAt(b * 3 + 2) !== m) { blocky = false; break; }
+    const m = gorgeModeAt(b * GORGE_BLOCK);
+    for (let j = 1; j < GORGE_BLOCK; j++) {
+      if (gorgeModeAt(b * GORGE_BLOCK + j) !== m) { blocky = false; break; }
+    }
+    if (!blocky) break;
   }
   ok(blocky, 'vista/cut alternate in coherent stretches');
   // Vista cliffs sit in the midground; cuts hug the road.
   const t = straightTrack(2252);
   const w = planWalls(t.cum, demoEvents(), resolveEnvOptions({}));
-  const vistaWalls = w.near.filter((s) => s.lateral >= 48);
-  const cutWalls = w.near.filter((s) => s.lateral < 48);
+  const vistaWalls = w.near.filter((s) => s.lateral >= 58);
+  const cutWalls = w.near.filter((s) => s.lateral < 58);
   ok(vistaWalls.length > 0 && cutWalls.length > 0, 'both vista + cut walls placed');
   const med = (a: number[]): number => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
   ok(med(vistaWalls.map((s) => s.lateral)) > med(cutWalls.map((s) => s.lateral)) * 1.4, 'vistas genuinely open');
@@ -402,7 +702,7 @@ import {
   const v = countInstances(t.cum, ev, resolveOptions({}));
   const draws = estimateDrawCalls(v) + estimateEnvDrawCalls(desk);
   const tris = estimateTriangles(v) + estimateEnvTriangles(desk);
-  ok(draws <= 9 && tris <= 40000, 'combined envelope holds', `draws=${draws} tris=${tris}`);
+  ok(draws <= 10 && tris <= 40000, 'combined envelope holds', `draws=${draws} tris=${tris}`);
   console.log(`    [measure-cycle4] env=${JSON.stringify(desk)} draws=${draws} tris=${tris}`);
 }
 
@@ -463,7 +763,8 @@ import {
     if (n >= 2) { run++; worst = Math.max(worst, run); }
     else run = 0;
   }
-  ok(worst <= 4, 'both-sides runs bounded (~56u max)', `worst=${worst} stations`);
+  ok(worst <= GORGE_MAX_CUT_RUN, 'both-sides runs bounded (~70u max)', `worst=${worst} stations`);
+  ok(worst >= 3, 'confinement lasts more than an instant', `worst=${worst} stations`);
   ok(seq.some((n) => n === 1), 'single-sided vista breaks exist');
 }
 
@@ -513,6 +814,300 @@ import {
   const tris = estimateTriangles(v) + estimateEnvTriangles(desk);
   ok(draws <= 10 && tris <= 40000, 'combined envelope holds', `draws=${draws} tris=${tris}`);
   console.log(`    [measure-cycle7] env=${JSON.stringify(desk)} draws=${draws} tris=${tris}`);
+}
+
+// ---------- Cycle 8: composition + grounding (packet 6) ----------
+
+// 31. Layered composition + composed open launch vista on a real elevation
+// profile: low opening shelves, distant separated formations, midground
+// terraces, one landmark, and confined sections later.
+{
+  const t = hillyTrack(2252);
+  const ev = demoEvents();
+  const o = resolveEnvOptions({});
+  const r = enforceCorridor(
+    t, planWalls(t.cum, ev, o), planMesas(t, o.halfW),
+    planArches(t.cum, o), planScrub(t.cum, o), o.halfW,
+  );
+  const terraces = r.mesas.filter(
+    (m) => m.haze === 0 && m.tint >= TERRACE_TINT_BASE && m.tint < LANDMARK_TINT,
+  );
+  ok(terraces.length >= 5, 'midground terrace layer exists', `n=${terraces.length}`);
+  ok(terraces.every((m) => m.w >= 12 && m.w <= 44 && m.h >= 10 && m.h <= 40), 'terraces are shelf-scale');
+  ok(terraces.every((m) => {
+    const lat = distToCenterline(t, m.x, m.z);
+    return lat > corridorNeed(o.halfW) && lat < 320;
+  }), 'terraces sit between the road and the far range');
+  const bodies = r.mesas.filter((m) => m.tint === LANDMARK_TINT);
+  ok(bodies.length === 1, 'exactly one landmark', `b=${bodies.length}`);
+  const L = bodies[0];
+  ok(L.w >= 40 && L.h >= 48, 'landmark is a large formation', `w=${L.w.toFixed(0)} h=${L.h.toFixed(0)}`);
+  ok(fracOf(t, L.x, L.z) <= 0.16, 'landmark anchors the approach', `f=${fracOf(t, L.x, L.z).toFixed(2)}`);
+  ok(distToCenterline(t, L.x, L.z) >= OPENING_LANDMARK_LATERAL,
+    'landmark reads at a clearly separated depth', `lat=${distToCenterline(t, L.x, L.z).toFixed(0)}`);
+  ok(r.walls.near.length > 0 && r.walls.far.length > 0, 'near + far cliff bands present');
+
+  // Opening composition: low shelves only, no tall cliff or close formation.
+  const openingWalls = r.walls.near.filter((w) => t.cum[w.idx] < OPENING_LEN);
+  ok(openingWalls.length > 0, 'opening keeps asymmetric framing shelves', `n=${openingWalls.length}`);
+  const maxOpenH = openingWalls.length ? Math.max(...openingWalls.map((w) => w.h)) : 0;
+  ok(openingWalls.every((w) => w.h <= 6), 'opening near walls are low shelves', `maxH=${maxOpenH.toFixed(1)}`);
+  const shelfSides = new Set(openingWalls.map((w) => w.side));
+  ok(shelfSides.size >= 1, 'opening shelves are asymmetric (one side at a time)');
+  const openingMesas = r.mesas.filter((m) => {
+    if (m.haze > 0) return false;
+    const i = nearestIndex(t, m.x, m.z);
+    return t.cum[i] < OPENING_LEN;
+  });
+  ok(openingMesas.every((m) => distToCenterline(t, m.x, m.z) >= OPENING_MIN_LATERAL - 1e-6),
+    'opening formations pushed to separated depth',
+    `minLat=${openingMesas.length ? Math.min(...openingMesas.map((m) => distToCenterline(t, m.x, m.z))).toFixed(0) : 'n/a'}`);
+
+  // Characteristic confinement resumes after the opening.
+  const laterTall = r.walls.near.filter((w) => t.cum[w.idx] > OPENING_LEN && w.h > 12);
+  ok(laterTall.length > 0, 'confined sections resume after the opening', `n=${laterTall.length}`);
+}
+
+// 31a. The opening rule is shared by every family on a track short enough that
+// arches/spires would otherwise fall inside it.
+{
+  const t = straightTrack(400);
+  const o = resolveEnvOptions({});
+  const arches = planArches(t.cum, o);
+  const openingArches = arches.filter((a) => t.cum[a.idx] < OPENING_LEN);
+  ok(openingArches.length > 0, 'short-track arches fall inside the opening to check');
+  ok(openingArches.every((a) => a.lateral >= OPENING_MIN_LATERAL - 1e-6),
+    'arches respect the opening push-out',
+    `min=${Math.min(...openingArches.map((a) => a.lateral)).toFixed(0)}`);
+  const mesas = planMesas(t, o.halfW).filter((m) => m.haze === 0);
+  const openingMesas = mesas.filter((m) => {
+    const i = nearestIndex(t, m.x, m.z);
+    return t.cum[i] < OPENING_LEN;
+  });
+  ok(openingMesas.every((m) => distToCenterline(t, m.x, m.z) >= OPENING_MIN_LATERAL - 1e-6),
+    'short-track mesas respect the opening push-out');
+  ok(openingLateral(150, 10, 40) === 150 && openingLateral(150, 200, 40) === 40,
+    'openingLateral clamps inside and preserves outside');
+}
+
+// 32. Grounding: formation bases stay below road grade (no hovering tips) and
+// the stable horizon ring stays below ground.
+{
+  const t = hillyTrack(2252);
+  const ev = demoEvents();
+  const o = resolveEnvOptions({});
+  const r = enforceCorridor(
+    t, planWalls(t.cum, ev, o), planMesas(t, o.halfW),
+    planArches(t.cum, o), planScrub(t.cum, o), o.halfW,
+  );
+  let floaters = 0;
+  for (const m of r.mesas) {
+    if (m.haze > 0) continue; // horizon ring checked separately
+    const ground = t.points[nearestIndex(t, m.x, m.z)].y - ENV_BASE_DROP;
+    if (m.y > ground + 1e-6) floaters++;
+  }
+  ok(floaters === 0, 'every formation base is anchored below road grade', `floaters=${floaters}`);
+  const horizon = r.mesas.filter((m) => m.haze > 0);
+  ok(horizon.length === 8 && horizon.every((m) => m.y < 0), 'horizon ring base stays below ground');
+  let minTop = Infinity, maxTop = -Infinity;
+  for (const m of horizon) { minTop = Math.min(minTop, m.y); maxTop = Math.max(maxTop, m.y); }
+  ok(maxTop - minTop < 40, 'horizon base band is shallow/stable', `span=${(maxTop - minTop).toFixed(1)}`);
+}
+
+// 33. Arch landmarks are grounded half-rings (not floating hoops) and clear
+// the road corridor on both quality tiers.
+{
+  const t = hillyTrack(2252);
+  for (const mobile of [false, true]) {
+    const o = resolveEnvOptions({ mobile });
+    const arches = planArches(t.cum, o);
+    const tier = mobile ? 'mobile' : 'desktop';
+    ok(arches.length === 3, `three arches (${tier})`);
+    ok(arches.every((a) => a.lateral - archExtent(a.r) >= corridorNeed(o.halfW) - 1e-9),
+      `arch ring clears road corridor (${tier})`);
+    const y = (a: { idx: number }) => t.points[a.idx].y;
+    ok(arches.every((a) => archCenterY(y(a), a.r) - archHalfHeight(a.r) <= y(a) - ENV_BASE_DROP),
+      `arch lower arc buried below grade (${tier})`);
+    ok(arches.every((a) => archCenterY(y(a), a.r) + archHalfHeight(a.r) > y(a) + 2),
+      `arch rises above the road as a landmark (${tier})`);
+  }
+}
+
+// 34. Both quality tiers keep the composed layers; mobile only thins
+// vegetation, and the landmark survives enforcement.
+{
+  const t = hillyTrack(2252);
+  const ev = demoEvents();
+  const desk = countEnvInstances(t, ev, resolveEnvOptions({}));
+  const mob = countEnvInstances(t, ev, resolveEnvOptions({ mobile: true }));
+  ok(mob.mesas === desk.mesas && mob.arches === desk.arches, 'mobile keeps mesas + arches (landmarks)');
+  ok(mob.scrub < desk.scrub, 'mobile thins vegetation');
+  ok(mob.walls <= desk.walls && mob.farWalls <= desk.farWalls, 'mobile never adds walls');
+  ok(envWithinBudget(desk) && envWithinBudget(mob), 'both tiers within budget');
+  const o = resolveEnvOptions({});
+  const r = enforceCorridor(
+    t, planWalls(t.cum, ev, o), planMesas(t, o.halfW),
+    planArches(t.cum, o), planScrub(t.cum, o), o.halfW,
+  );
+  ok(r.mesas.some((m) => m.tint === LANDMARK_TINT), 'landmark survives corridor enforcement');
+  const terraces = r.mesas.filter((m) => m.tint >= TERRACE_TINT_BASE && m.tint < LANDMARK_TINT);
+  ok(terraces.length >= 5, 'terrace layer survives corridor enforcement', `n=${terraces.length}`);
+}
+
+// 35. Fixed daily seeds: composition + grounding hold on real tracks (both
+// road/rail exclusion is enforced by the same planner the corridor audit uses).
+{
+  for (const day of ['2026-09-07', '2026-08-15', '2026-07-04', '2026-06-21']) {
+    const daily = acceptDailyTrack(day);
+    const tv = trackFromPoints(daily.points, TRACK_HALF_W);
+    const t: TrackData = {
+      points: daily.points.map((p) => ({ x: p.x, y: p.y, z: p.z })),
+      tangents: tv.tx.map((x, k) => ({ x, y: 0, z: tv.tz[k] })),
+      normals: tv.nx.map((x, k) => ({ x, y: 0, z: tv.nz[k] })),
+      cum: arcLengths(daily.points),
+      events: daily.stats.events,
+    };
+    const o = resolveEnvOptions({ halfW: TRACK_HALF_W });
+    const r = enforceCorridor(
+      t, planWalls(t.cum, daily.stats.events, o), planMesas(t, o.halfW),
+      planArches(t.cum, o), planScrub(t.cum, o), o.halfW,
+    );
+    ok(r.mesas.filter((m) => m.tint === LANDMARK_TINT).length === 1, `landmark present ${day}`);
+    ok(r.mesas.filter((m) => m.tint >= TERRACE_TINT_BASE && m.tint < LANDMARK_TINT).length >= 5,
+      `terraces present ${day}`);
+    let floaters = 0, minClear = Infinity;
+    for (const m of r.mesas) {
+      if (m.haze > 0) continue;
+      const gi = nearestIndex(t, m.x, m.z);
+      const ground = t.points[gi].y - ENV_BASE_DROP;
+      if (m.y > ground + 1e-6) floaters++;
+      minClear = Math.min(minClear, ground - m.y);
+    }
+    ok(floaters === 0, `no floating formation bases ${day}`, `floaters=${floaters} minClear=${minClear.toFixed(2)}`);
+    // The landmark must clear the corridor and stay within approach depth.
+    const lm = r.mesas.find((m) => m.tint === LANDMARK_TINT) as { x: number; z: number };
+    ok(distToCenterline(t, lm.x, lm.z) - corridorNeed(o.halfW) >= 0, `landmark corridor-clear ${day}`);
+  }
+}
+
+// 36. Fixed course identity + launch composition (practice/benchmark). Consumes
+// the authored course geometry; does not edit the courses module.
+{
+  for (const mode of ['practice', 'benchmark'] as const) {
+    const a = resolveCourse(mode, '2026-09-15');
+    const b = resolveCourse(mode, '2026-01-01');
+    ok(a === b && a.track.checksum === b.track.checksum, `${mode}: fixed identity is day-independent`);
+    ok(a.reference !== null && a.reference.track?.course === a.track.checksum,
+      `${mode}: reference matches the built geometry`);
+
+    const daily = a.track;
+    const tv = trackFromPoints(daily.points, TRACK_HALF_W);
+    const t: TrackData = {
+      points: daily.points.map((p) => ({ x: p.x, y: p.y, z: p.z })),
+      tangents: tv.tx.map((x, k) => ({ x, y: 0, z: tv.tz[k] })),
+      normals: tv.nx.map((x, k) => ({ x, y: 0, z: tv.nz[k] })),
+      cum: arcLengths(daily.points),
+      events: daily.stats.events,
+    };
+    const o = resolveEnvOptions({ halfW: TRACK_HALF_W });
+    const r = enforceCorridor(
+      t, planWalls(t.cum, daily.stats.events, o), planMesas(t, o.halfW),
+      planArches(t.cum, o), planScrub(t.cum, o), o.halfW,
+    );
+    // Opening sky: only low shelves, pushed-out far range, separated formations.
+    const openN = r.walls.near.filter((w) => t.cum[w.idx] < OPENING_LEN);
+    ok(openN.length > 0 && openN.every((w) => w.h <= 6),
+      `${mode}: opening near walls are low shelves`,
+      `maxH=${openN.length ? Math.max(...openN.map((w) => w.h)).toFixed(1) : 'n/a'}`);
+    const openFar = r.walls.far.filter((w) => t.cum[w.idx] < OPENING_LEN);
+    ok(openFar.every((w) => w.lateral >= OPENING_FAR_LATERAL - 1e-6),
+      `${mode}: opening far range pushed to separated depth`);
+    const openM = r.mesas.filter((m) => m.haze === 0 && t.cum[nearestIndex(t, m.x, m.z)] < OPENING_LEN);
+    ok(openM.every((m) => distToCenterline(t, m.x, m.z) >= OPENING_MIN_LATERAL - 1e-6),
+      `${mode}: opening formations separated`);
+    // No both-sided tall cliff in the opening; the first pair starts after it.
+    const tall = r.walls.near.filter((w) => w.h >= 12).sort((x, y) => t.cum[x.idx] - t.cum[y.idx]);
+    let firstBoth = Infinity;
+    for (const w of tall) {
+      const s = t.cum[w.idx];
+      if (tall.some((v) => v !== w && v.side === -w.side && Math.abs(t.cum[v.idx] - s) <= 30)) {
+        firstBoth = Math.min(firstBoth, s);
+      }
+    }
+    ok(firstBoth >= OPENING_LEN, `${mode}: no both-sided tall cliffs in the opening`,
+      `first=${firstBoth === Infinity ? 'none' : firstBoth.toFixed(0)}`);
+    // Far range is one-sided everywhere: never a symmetric far corridor.
+    let farPair = 0;
+    for (const w of r.walls.far) {
+      for (const v of r.walls.far) {
+        if (v !== w && v.side === -w.side && Math.abs(t.cum[v.idx] - t.cum[w.idx]) <= 40) farPair++;
+      }
+    }
+    ok(farPair === 0, `${mode}: far range never forms a symmetric corridor`, `pairs=${farPair}`);
+    // Purposeful one-sided later gorges: confinement resumes after the ease-in.
+    ok(r.walls.near.some((w) => t.cum[w.idx] > OPENING_LEN + EASEIN_LEN && w.h > 12),
+      `${mode}: confined near cliffs resume after the opening`);
+    // Camera-visible tall families (including hazed horizon buttes) must not
+    // loom over the launch: horizon centers clear the whole course, and the
+    // forward-arc elevation stays modest (open sky).
+    const horizon = r.mesas.filter((m) => m.haze > 0);
+    ok(horizon.length === 8 && horizon.every((m) => distToCenterline(t, m.x, m.z) >= HORIZON_CLEAR - 1e-6),
+      `${mode}: horizon ring clears the course`,
+      `min=${Math.min(...horizon.map((m) => distToCenterline(t, m.x, m.z))).toFixed(0)}`);
+    const elev = launchMaxElevation(t, r);
+    ok(elev <= 22, `${mode}: launch forward sky is open`, `maxElev=${elev.toFixed(1)}deg`);
+    const counts = countEnvInstances(t, daily.stats.events, o);
+    ok(envWithinBudget(counts), `${mode}: environment within budget`, JSON.stringify(counts));
+  }
+}
+
+// Surface contract + expansive dirt plain (speed/dirt presentation).
+{
+  // groundSurfaceY: exact road height on the road, flat both ends, plain beyond.
+  const halfW = 11.5, roadY = 3.2;
+  ok(groundSurfaceY(roadY, 0, halfW) === roadY, 'surface is road height on the road');
+  ok(groundSurfaceY(roadY, halfW, halfW) === roadY, 'surface is road height exactly at the edge');
+  ok(groundSurfaceY(roadY, -halfW, halfW) === roadY, 'surface is symmetric at the edge');
+  ok(Math.abs(groundSurfaceY(roadY, halfW + DIRT_VERGE_WIDTH, halfW) - DIRT_PLAIN_Y) < 1e-9,
+    'surface reaches the plain at the verge end');
+  ok(Math.abs(groundSurfaceY(roadY, halfW + DIRT_VERGE_WIDTH * 5, halfW) - DIRT_PLAIN_Y) < 1e-9,
+    'surface stays flat plain everywhere beyond the verge');
+  // Monotonic blend with flat (zero-slope) ends: smoothstep, never a step.
+  let prev = groundSurfaceY(roadY, halfW, halfW);
+  let maxStep = 0;
+  for (let d = 1; d <= DIRT_VERGE_WIDTH; d++) {
+    const y = groundSurfaceY(roadY, halfW + d, halfW);
+    maxStep = Math.max(maxStep, Math.abs(y - prev));
+    prev = y;
+  }
+  ok(prev <= groundSurfaceY(roadY, halfW, halfW), 'verge descends from road to plain');
+  ok(maxStep <= (Math.abs(roadY - DIRT_PLAIN_Y) / DIRT_VERGE_WIDTH) * 1.5 + 1e-9,
+    'verge slope is smooth (no vertical step)', `maxStep=${maxStep.toFixed(3)}`);
+  const nearEdge = groundSurfaceY(roadY, halfW, halfW);
+  const edgePlus = groundSurfaceY(roadY, halfW + 0.01, halfW);
+  ok(Math.abs(edgePlus - nearEdge) < 0.01, 'verge is tangent-flat at the road edge');
+
+  // Plain footprint covers the whole course with a generous margin.
+  const sample = [
+    { x: -1500, y: 0, z: -900 },
+    { x: 1700, y: 8, z: 1200 },
+    { x: 400, y: -1, z: 300 },
+  ];
+  const b = groundPlainBounds(sample, 900);
+  ok(b.cx === 100 && b.cz === 150, 'plain is centered on the course bounds', `${b.cx},${b.cz}`);
+  const half = b.size / 2;
+  ok(sample.every((p) => Math.abs(p.x - b.cx) <= half && Math.abs(p.z - b.cz) <= half),
+    'every course point sits inside the plain footprint');
+  ok(half - Math.max(1700 - b.cx, 1200 - b.cz) >= 899,
+    'plain keeps the requested margin past the course edge', `margin=${(half - 1600).toFixed(0)}`);
+  ok(groundPlainBounds([], 900).size === 1800, 'empty course still gets a finite plain');
+
+  // Recentred plane must out-extend the camera far plane so driving onto the
+  // plain can never reveal a hard ground edge inside the frustum.
+  const cameraFar = 2000;
+  ok(groundPlainCovers(cameraFar), 'recentred plain always extends past camera far',
+    `nearest=${(GROUND_PLAIN_MIN_SIZE / 2 - GROUND_PLAIN_SNAP / 2).toFixed(0)} >= ${cameraFar}`);
+  ok(GROUND_PLAIN_MIN_SIZE >= 4 * cameraFar, 'plain min size keeps a generous frustum margin', `${GROUND_PLAIN_MIN_SIZE}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

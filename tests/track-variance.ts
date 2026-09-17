@@ -7,7 +7,8 @@
 // sim-side by harness section 13, which this suite does not duplicate).
 declare const process: { exit(c: number): void };
 import {
-  AcceptedTrack, CLEAR_MIN, DRIFT_MAX, DRIFT_MIN, EVENT_MAX,
+  AcceptedTrack, CLEAR_MIN, DRIFT_MAX, DRIFT_MIN, EST_MAX_S, EST_MIN_S,
+  EVENT_MAX,
   EVENT_MIN, FIRST_MAX, FIRST_MIN, GRADE_MAX, LEN_MAX, LEN_MIN, SWEEP_MAX,
   SWEEP_MIN, TRACK_HALF_W, analyzeCenterline, acceptDailyTrack,
   buildCenterline, canonicalGrammar, checksumPoints, estimateCleanTime,
@@ -62,9 +63,7 @@ function quotas(a: AcceptedTrack): string[] {
   }
   if (flatBad) bad.push('start-flat');
   if (finBad) bad.push('finish-flat');
-  // Estimator band: near-optimal envelope pace (see track-cycle3.md for the
-  // autopilot/human mapping behind the 35-50s human target).
-  if (!(a.estTimeS >= 34 && a.estTimeS <= 47)) bad.push(`est=${a.estTimeS.toFixed(1)}`);
+  if (!(a.estTimeS >= EST_MIN_S && a.estTimeS <= EST_MAX_S)) bad.push(`est=${a.estTimeS.toFixed(1)}`);
   return bad;
 }
 
@@ -112,20 +111,22 @@ for (let d = 1; d <= 30; d++) days.push(`2026-07-${String(d).padStart(2, '0')}`)
 
 // 4. Drift corners have real arc length (three-line choice, no trivial cuts).
 {
-  let short = 0, total = 0, tight = 0;
+  let short = 0, total = 0, decTight = 0;
   for (const day of days) {
     const a = acceptDailyTrack(day);
     for (const e of a.stats.events) {
       if (e.medR >= 45 && e.medR <= 130) {
         total++;
-        // The one decreasing challenge is exempt from the long-arc floor.
-        if (e.decreasing && e.medR < 62) { tight++; continue; }
+        // The decreasing challenge is the one tight event; the deliberate tight
+        // corners (68-84u) are short by design and exempt from the long-arc floor.
+        if (e.decreasing) { decTight++; continue; }
+        if (e.medR < 90) continue;
         if (e.endS - e.startS < 140) short++;
       }
     }
   }
-  tvOk(total > 300 && short === 0, 'drift arcs fit multiple lines', `n=${total} short=${short}`);
-  tvOk(tight >= 55 && tight <= 70, 'one tight challenge per track', `tight=${tight}/60`);
+  tvOk(total > 300 && short === 0, 'committed drift arcs fit multiple lines', `n=${total} short=${short}`);
+  tvOk(decTight >= 55 && decTight <= 70, 'one tight challenge per track', `tight=${decTight}/60`);
 }
 
 // 5. Canonical fallback satisfies the same quotas.

@@ -43,7 +43,9 @@ export function resolveEnvOptions(o: EnvironmentOptions = {}): EnvResolved {
   return {
     halfW: o.halfW ?? 8,
     wallStep: o.wallStep ?? 14,
-    scrubStep: o.scrubStep ?? (mobile ? 20 : 12),
+    // Sparser vegetation than the old 12/20 fence; clustering below keeps
+    // cover while removing the repeating-triangle read.
+    scrubStep: o.scrubStep ?? (mobile ? 28 : 16),
     mobile,
   };
 }
@@ -59,6 +61,44 @@ export const ENV_BUDGET = {
   MAX_NEW_TRIS: 26000,
 } as const;
 
+export interface GroundPlainBounds {
+  cx: number; cz: number; size: number; minY: number; maxY: number;
+}
+
+// The dirt plain is recentred on the camera in whole grid steps, so a plain of
+// at least this size always extends past the camera far plane: the nearest edge
+// is >= MIN_SIZE/2 - SNAP/2 from the camera. Camera far is 2000 in main.ts.
+export const GROUND_PLAIN_MIN_SIZE = 8000;
+export const GROUND_PLAIN_SNAP = 500;
+export function groundPlainCovers(cameraFar: number): boolean {
+  return GROUND_PLAIN_MIN_SIZE / 2 - GROUND_PLAIN_SNAP / 2 >= cameraFar;
+}
+
+/**
+ * Expansive dirt-plain footprint from the full course bounds with a generous
+ * margin, so the horizon reads as one flat plain instead of a finite floor and
+ * no course point sits near a visible ground edge. Square, centered on the
+ * course bounding box; the renderer places the plane at the shared
+ * `DIRT_PLAIN_Y` height from ./surface.ts.
+ */
+export function groundPlainBounds(pts: { x: number; y: number; z: number }[], margin = 1200): GroundPlainBounds {
+  if (pts.length === 0) return { cx: 0, cz: 0, size: margin * 2, minY: 0, maxY: 0 };
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.z < minZ) minZ = p.z;
+    if (p.z > maxZ) maxZ = p.z;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const cx = (minX + maxX) / 2;
+  const cz = (minZ + maxZ) / 2;
+  const span = Math.max(maxX - minX, maxZ - minZ);
+  return { cx, cz, size: span + margin * 2, minY, maxY };
+}
+
 // Sightline contract: road-edge families stay low and clear of the road so
 // corner exits stay visible over/around them from chase-cam height.
 export const SIGHTLINE = {
@@ -68,6 +108,46 @@ export const SIGHTLINE = {
   MAX_SCRUB_H: 1.6,
   MIN_ARCH_LATERAL: 22,
 } as const;
+
+// ---------- deliberate composition ----------
+
+// A phrase lasts GORGE_BLOCK stations (~56u at the 14u wall step). Block 0 is
+// always an open vista so the launch approach is never a slab corridor. Runs
+// of both-sides confinement are capped at the original GORGE_MAX_CUT_RUN = 4
+// (~56u), so every enclosed cut decompresses into an overlook.
+export const GORGE_BLOCK = 4;
+export const GORGE_MAX_CUT_RUN = 4;
+
+// The first OPENING_LEN metres of road are a composed, deliberately open
+// launch vista. Inside it:
+//  - near walls collapse to low asymmetric shelves (see planWalls),
+//  - every other family (mesas, terraces, spires, piers, arches) is pushed out
+//    to at least OPENING_MIN_LATERAL so silhouettes read at a separated depth
+//    instead of crowding the chase-camera view corridor,
+//  - the far range is pushed to OPENING_FAR_LATERAL and made one-sided,
+//  - the landmark sits at OPENING_LANDMARK_LATERAL or beyond as the one clear
+//    distant silhouette.
+// A short EASEIN_LEN ramp after the opening stays one-sided with capped cliffs
+// before full confinement resumes. These rules apply to fixed practice/
+// benchmark course geometry as well as the daily generator.
+export const OPENING_LEN = 180;
+export const EASEIN_LEN = 80;
+export const OPENING_MIN_LATERAL = 150;
+export const OPENING_LANDMARK_LATERAL = 195;
+export const OPENING_FAR_LATERAL = 240;
+// Minimum center distance any hazed horizon butte keeps from the course, so a
+// compact authored course can never have a ring butte looming over the launch.
+export const HORIZON_CLEAR = 300;
+
+// All solid formations are anchored ENV_BASE_DROP below road grade and extend
+// downward from there, so no piece hovers above the terrain and unsupported
+// tips never cross the racing view.
+export const ENV_BASE_DROP = 8;
+
+// Midground terraces sit between the near cliffs and the far buttes; the one
+// landmark is the memorable silhouette of the course.
+export const TERRACE_TINT_BASE = 220;
+export const LANDMARK_TINT = 250;
 
 // Fog-compatible haze target for horizon silhouettes (matches scene fog).
 export const HAZE_COLOR = 0xeab183;
@@ -119,6 +199,29 @@ export function mesaExtent(w: number, d: number): number {
 }
 export function archExtent(r: number): number {
   return r * 1.28 + CORRIDOR.JITTER;
+}
+// Arch vertical half-extent (mount scales y by r*1.2; outer local radius 1.28).
+export function archHalfHeight(r: number): number {
+  return r * 1.28 * 1.2;
+}
+// Ring center height for a half-buried arch: the lower arc is sunk below road
+// grade so the ring reads as a grounded arch, never a floating hoop.
+export function archCenterY(roadY: number, r: number): number {
+  return roadY - ENV_BASE_DROP + r * 0.5;
+}
+// Opening composition rule shared by every formation family: inside the launch
+// vista (s < OPENING_LEN) push the body out to at least `minLateral` so the
+// forward chase-camera view stays open; outside it, keep the planned lateral.
+export function openingLateral(minLateral: number, s: number, base: number): number {
+  return s < OPENING_LEN ? Math.max(base, minLateral) : base;
+}
+// Far-range version: hard push to OPENING_FAR_LATERAL through the launch, then
+// a linear ramp back to the planned lateral over the next ~220u so the far
+// buttes separate the vista instead of forming an early wall on both sides.
+export function farOpeningLateral(s: number, base: number): number {
+  if (s < OPENING_LEN) return Math.max(base, OPENING_FAR_LATERAL);
+  const t = Math.min(1, (s - OPENING_LEN) / 220);
+  return base + (1 - t) * 110;
 }
 export function scrubExtent(w: number): number {
   return 0.9 * w + 0.3;
@@ -199,14 +302,18 @@ export function isGatePier(tint: number): boolean {
   return tint >= PIER_TINT_MIN;
 }
 
-// Gorge rhythm: stations alternate between enclosed cuts (walls flank both
-// sides) and open overlooks (one distant cliff, other side left open for a
-// vista). Blocks of 3 stations flip on a ~36% deterministic hash so the road
-// breathes instead of forming a uniform corridor.
+// Gorge rhythm: deliberate phrases alternate enclosed cuts (walls flank both
+// sides) with open overlooks (one midground cliff, the other side left open to
+// the horizon). Block 0 is an open launch vista; later phrases alternate with
+// deterministic repeats so stretches feel composed rather than metronomic.
 export type GorgeMode = 'cut' | 'vista';
 export function gorgeModeAt(station: number): GorgeMode {
-  const block = Math.floor(station / 3);
-  return hash01(block * 131 + 7) < 0.36 ? 'vista' : 'cut';
+  const block = Math.floor(station / GORGE_BLOCK);
+  if (block === 0) return 'vista';
+  const wave = block % 2; // 1 => cut, 0 => vista
+  const repeat = hash01(block * 131 + 7) < 0.35;
+  const cut = repeat ? wave === 1 : wave === 0;
+  return cut ? 'cut' : 'vista';
 }
 
 // Mean cut-wall height per 5-station ridgeline block (pure probe for the
@@ -244,37 +351,75 @@ export function planWalls(
     next = cum[i] + o.wallStep;
     const s = cum[i];
     const corner = cornerAt(events, s);
-    let mode = gorgeModeAt(si);
-    // Corridor breaker: never flank both sides for more than 4 consecutive
-    // stations (~56u), so no both-sides-tall run can exceed 60u of road.
-    if (mode === 'cut' && run >= 4) mode = 'vista';
+    const opening = s < OPENING_LEN;
+    const easein = !opening && s < OPENING_LEN + EASEIN_LEN;
+    let mode = (opening || easein) ? 'vista' : gorgeModeAt(si);
+    // Corridor breaker: never flank both sides for more than GORGE_MAX_CUT_RUN
+    // consecutive stations (~56u), so every confinement opens out.
+    if (!opening && !easein && mode === 'cut' && run >= GORGE_MAX_CUT_RUN) mode = 'vista';
     si++;
     run = mode === 'vista' ? 0 : run + 1;
-    if (mode === 'vista') {
-      // Open overlook: one distant midground cliff, far side left open.
-      // Corner-inside sightline caps still apply when the cliff falls inside.
+    if (opening) {
+      // Composed launch vista: only sparse, low asymmetric shelves frame the
+      // road. No tall cliff is placed inside the forward chase-camera corridor,
+      // so the opening reads open while still having a near edge.
+      if (si % 2 === 0) {
+        n++;
+        const side = hash01(si * 29 + 1) < 0.5 ? -1 : 1;
+        const h = 1.5 + hash01(n * 2 + 2) * 3.0;
+        const w = 10 + hash01(n * 2 + 3) * 10;
+        const segLen = o.wallStep * 1.6;
+        const yaw = (hash01(n * 3 + 5) - 0.5) * 0.9;
+        const lateral = Math.max(
+          22 + hash01(n * 2 + 1) * 16,
+          corridorNeed(o.halfW) + wallExtent(w, segLen, yaw),
+        );
+        near.push({ idx: i, side, lateral, h, w, segLen, tint: n, yaw });
+      }
+    } else if (easein) {
+      // One-sided, set-back midground cliff with capped height: the sky stays
+      // open through the approach while the track still gains an edge.
       n++;
       const side = hash01(si * 29 + 1) < 0.5 ? -1 : 1;
-      let h = 12 + hash01(n * 2 + 2) * 20;
+      let h = 10 + hash01(n * 2 + 2) * 12;
       if (corner && side === insideOf(corner)) h = Math.min(h, SIGHTLINE.INSIDE_HEIGHT_CAP);
-      const w = 8 + hash01(n * 2 + 3) * 12;
+      const w = 12 + hash01(n * 2 + 3) * 16;
       const segLen = o.wallStep * 2.0;
+      const yaw = (hash01(n * 3 + 5) - 0.5) * 0.9;
+      const inside = corner !== null && side === insideOf(corner);
+      const lateral = Math.max(
+        74 + hash01(n * 2 + 1) * 50,
+        corridorNeed(o.halfW) + wallExtent(w, segLen, yaw) + (inside ? CORRIDOR.CURVE_EXTRA : 0),
+      );
+      near.push({ idx: i, side, lateral, h, w, segLen, tint: n, yaw });
+    } else if (mode === 'vista') {
+      // Open overlook: one broad, set-back midground cliff on one side, the
+      // other side open to the far range/horizon. This is the "release" that
+      // gives the track its breathing vistas.
+      n++;
+      const side = hash01(si * 29 + 1) < 0.5 ? -1 : 1;
+      let h = 16 + hash01(n * 2 + 2) * 26;
+      if (corner && side === insideOf(corner)) h = Math.min(h, SIGHTLINE.INSIDE_HEIGHT_CAP);
+      const w = 12 + hash01(n * 2 + 3) * 18;
+      const segLen = o.wallStep * 2.4;
       const yaw = (hash01(n * 3 + 5) - 0.5) * 0.9;
       const inside = corner !== null && side === insideOf(corner);
       // Exclusion envelope: no vertex inside the road/guardrail corridor.
       const lateral = Math.max(
-        48 + hash01(n * 2 + 1) * 45,
+        58 + hash01(n * 2 + 1) * 80,
         corridorNeed(o.halfW) + wallExtent(w, segLen, yaw) + (inside ? CORRIDOR.CURVE_EXTRA : 0),
       );
       near.push({ idx: i, side, lateral, h, w, segLen, tint: n, yaw });
     } else {
-      // Ridgeline phrase: each ~5-station block gets one tall/short bias,
-      // so the skyline alternates in coherent phrases (see ridgeBlockMean).
-      const phrase = hash01(Math.floor(si / 5) * 57 + 3);
+      // Confined cut: asymmetric shoulders (one tall wall, one low ledge)
+      // break the "plain slab" read, and each phrase gets a coherent tall/short
+      // bias so the skyline alternates in phrases (see ridgeBlockMean).
+      const phrase = hash01(Math.floor(si / GORGE_BLOCK) * 57 + 3);
       const phraseScale = 0.72 + phrase * 0.65;
       for (const side of [1, -1]) {
         n++;
-        let h = (14 + hash01(n * 2 + 2) * 18) * phraseScale;
+        const shoulder = hash01(n * 5 + 11) < 0.5 ? 1.25 : 0.75;
+        let h = (15 + hash01(n * 2 + 2) * 15) * phraseScale * shoulder;
         const inside = corner !== null && side === insideOf(corner);
         if (inside) h = Math.min(h, SIGHTLINE.INSIDE_HEIGHT_CAP);
         const w = 6 + hash01(n * 2 + 3) * 8;
@@ -290,31 +435,37 @@ export function planWalls(
       }
     }
   }
+  // Far range: ONE butte per station on an alternating side, so it can never
+  // form a symmetric far corridor on both sides of the road. Inside the launch
+  // vista it is pushed to OPENING_FAR_LATERAL, then ramps back over ~220u, and
+  // its height ramps up with distance so the opening stays airy.
   let m = 0;
-  let farNext = 60;
+  let farNext = 70;
   for (let i = 1; i < cum.length - 1 && farNext < total - 10; i++) {
     if (cum[i] < farNext) continue;
-    farNext = cum[i] + 60;
-    for (const side of [1, -1]) {
-      m++;
-      const w = 30 + hash01(1299709 + m) * 40;
-      const segLen = 90;
-      const yaw = (hash01((5000 + m) * 3 + 5) - 0.5) * 0.9;
-      const corner = cornerAt(events, cum[i]);
-      const inside = corner !== null && side === insideOf(corner);
-      far.push({
-        idx: i, side,
-        lateral: Math.max(
-          70 + hash01(7919 + m * 2) * 60,
-          corridorNeed(o.halfW) + wallExtent(w, segLen, yaw) + (inside ? CORRIDOR.CURVE_EXTRA : 0),
-        ),
-        h: 40 + hash01(104729 + m * 2) * 50,
-        w,
-        segLen,
-        tint: 5000 + m,
-        yaw,
-      });
-    }
+    farNext = cum[i] + 90;
+    m++;
+    const side = hash01(m * 37 + 5) < 0.5 ? -1 : 1;
+    const w = 30 + hash01(1299709 + m) * 40;
+    const segLen = 90;
+    const yaw = (hash01((5000 + m) * 3 + 5) - 0.5) * 0.9;
+    const corner = cornerAt(events, cum[i]);
+    const inside = corner !== null && side === insideOf(corner);
+    const base = Math.max(
+      90 + hash01(7919 + m * 2) * 70,
+      corridorNeed(o.halfW) + wallExtent(w, segLen, yaw) + (inside ? CORRIDOR.CURVE_EXTRA : 0),
+    );
+    const approach = Math.min(1, Math.max(0, (cum[i] - OPENING_LEN) / 220));
+    far.push({
+      idx: i,
+      side,
+      lateral: farOpeningLateral(cum[i], base),
+      h: (30 + hash01(104729 + m * 2) * 50) * (0.55 + 0.45 * approach),
+      w,
+      segLen,
+      tint: 5000 + m,
+      yaw,
+    });
   }
   if (near.length + far.length > ENV_BUDGET.MAX_WALLS) {
     near.length = Math.max(0, ENV_BUDGET.MAX_WALLS - far.length);
@@ -343,14 +494,14 @@ export function planMesas(track: TrackData, halfW = 8): Mesa[] {
     const side = k % 2 ? -1 : 1;
     const w = 40 + hash01(77 + k * 13) * 50;
     // Exclusion envelope: mid mesas are wide (radius ~= w), so small-hash
-    // laterals would otherwise land on the course.
-    const lateral = Math.max(
+    // laterals would otherwise land on the course. Opening vista push-out.
+    const lateral = openingLateral(OPENING_MIN_LATERAL, track.cum[i], Math.max(
       90 + hash01(31 + k * 7) * 120,
       corridorNeed(halfW) + mesaExtent(w, mesaDepth(k, w)),
-    );
+    ));
     out.push({
       x: p.x + nrm.x * side * lateral,
-      y: p.y - 8,
+      y: p.y - ENV_BASE_DROP,
       z: p.z + nrm.z * side * lateral,
       w,
       h: 50 + hash01(101 + k * 17) * 40,
@@ -368,9 +519,13 @@ export function planMesas(track: TrackData, halfW = 8): Mesa[] {
     if (p.y < minY) minY = p.y;
   }
   const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+  // Course radius: the horizon ring must clear the whole course, not just its
+  // bounding-box center, so compact fixed courses don't get a near butte.
+  let spanR = 0;
+  for (const p of track.points) spanR = Math.max(spanR, Math.hypot(p.x - cx, p.z - cz));
   for (let k = 0; k < 8; k++) {
     const a = (k / 8) * Math.PI * 2 + hash01(1001 + k) * 0.5;
-    const r = 420 + hash01(2002 + k * 3) * 320;
+    const r = Math.max(420, spanR + HORIZON_CLEAR) + hash01(2002 + k * 3) * 200;
     out.push({
       x: cx + Math.cos(a) * r,
       y: minY - 20 - hash01(3003 + k) * 20,
@@ -388,13 +543,13 @@ export function planMesas(track: TrackData, halfW = 8): Mesa[] {
     const nrm = track.normals[i];
     const side = k === 0 ? 1 : -1;
     const w = 6 + hash01(7007 + k) * 3;
-    const lateral = Math.max(
+    const lateral = openingLateral(OPENING_MIN_LATERAL, track.cum[i], Math.max(
       55 + hash01(6006 + k) * 20,
       corridorNeed(halfW) + mesaExtent(w, mesaDepth(200 + k, w)),
-    );
+    ));
     out.push({
       x: p.x + nrm.x * side * lateral,
-      y: p.y - 6,
+      y: p.y - ENV_BASE_DROP,
       z: p.z + nrm.z * side * lateral,
       w,
       h: 70 + hash01(8008 + k) * 25,
@@ -402,24 +557,24 @@ export function planMesas(track: TrackData, halfW = 8): Mesa[] {
       tint: 200 + k,
     });
   });
-  // Gate piers: two pale pier pairs flanking the road (start straight +
-  // mid course). Rendered through the mesa instanced mesh (no new draw
-  // call); mount bleaches them via PIER_TINT so they read as engineered
+  // Gate piers: two pale pier pairs flanking the road (after the opening
+  // vista + mid course). Rendered through the mesa instanced mesh (no new
+  // draw call); mount bleaches them via PIER_TINT so they read as engineered
   // concrete gates, not rock. Narrow, so the corridor math keeps them close.
-  [0.03, 0.5].forEach((f, k) => {
+  [0.12, 0.5].forEach((f, k) => {
     const i = at(f);
     const p = track.points[i];
     const nrm = track.normals[i];
     for (const side of [1, -1]) {
       const tint = PIER_TINT_MIN + k * 2 + (side < 0 ? 1 : 0);
       const w = 3 + hash01(6100 + tint) * 1.5;
-      const lateral = Math.max(
+      const lateral = openingLateral(OPENING_MIN_LATERAL, track.cum[i], Math.max(
         corridorNeed(halfW) + mesaExtent(w, mesaDepth(tint, w)) + 1.5,
         SIGHTLINE.MIN_WALL_LATERAL,
-      );
+      ));
       out.push({
         x: p.x + nrm.x * side * lateral,
-        y: p.y - 4,
+        y: p.y - ENV_BASE_DROP,
         z: p.z + nrm.z * side * lateral,
         w,
         h: 30 + hash01(6200 + tint) * 12,
@@ -428,6 +583,51 @@ export function planMesas(track: TrackData, halfW = 8): Mesa[] {
       });
     }
   });
+  // Midground terrace layer: deliberate shelf buttes between the road and the
+  // far range so open vistas read as layered depth instead of empty ground.
+  // Placed on alternating sides at fixed fractions, base-anchored below grade.
+  [0.06, 0.18, 0.31, 0.45, 0.58, 0.72, 0.88].forEach((f, k) => {
+    const i = at(f);
+    const p = track.points[i];
+    const nrm = track.normals[i];
+    const side = k % 2 ? -1 : 1;
+    const w = 16 + hash01(14000 + k * 17) * 20;
+    const lateral = openingLateral(OPENING_MIN_LATERAL, track.cum[i], Math.max(
+      52 + hash01(14200 + k * 23) * 70,
+      corridorNeed(halfW) + mesaExtent(w, mesaDepth(TERRACE_TINT_BASE + k, w)) + 4,
+    ));
+    out.push({
+      x: p.x + nrm.x * side * lateral,
+      y: p.y - ENV_BASE_DROP,
+      z: p.z + nrm.z * side * lateral,
+      w,
+      h: 14 + hash01(14100 + k * 19) * 18,
+      haze: 0,
+      tint: TERRACE_TINT_BASE + k,
+    });
+  });
+  // One memorable landmark per course: a single broad, tall flat-topped butte
+  // (its pale caprock is baked into the shared strata geometry) set well beyond
+  // the opening shelves so it reads as a clearly separated distant silhouette.
+  // No stacked cap: nothing unsupported appears near the horizon.
+  {
+    const i = at(0.08);
+    const p = track.points[i];
+    const nrm = track.normals[i];
+    const side = 1;
+    const w = 42 + hash01(15000 + n) * 14;
+    const h = 50 + hash01(15001 + n) * 18;
+    const lateral = Math.max(
+      OPENING_LANDMARK_LATERAL + hash01(15002 + n) * 60,
+      corridorNeed(halfW) + mesaExtent(w, mesaDepth(LANDMARK_TINT, w)) + 8,
+    );
+    out.push({
+      x: p.x + nrm.x * side * lateral,
+      y: p.y - ENV_BASE_DROP,
+      z: p.z + nrm.z * side * lateral,
+      w, h, haze: 0, tint: LANDMARK_TINT,
+    });
+  }
   if (out.length > ENV_BUDGET.MAX_MESAS) out.length = ENV_BUDGET.MAX_MESAS;
   return out;
 }
@@ -445,11 +645,11 @@ export function planArches(cum: number[], o: EnvResolved): Arch[] {
     // Roadside arches never span the road, so the ring must clear the
     // corridor like every other family (spanning would need verified
     // vertical clearance instead — not used).
-    const lateral = Math.max(
+    const lateral = openingLateral(OPENING_MIN_LATERAL, s, Math.max(
       24 + hash01(9009 + k * 11) * 8,
       SIGHTLINE.MIN_ARCH_LATERAL,
       corridorNeed(o.halfW) + archExtent(r),
-    ) + CORRIDOR.PUSHBACK;
+    ) + CORRIDOR.PUSHBACK);
     out.push({ idx: indexAtS(cum, s), side: k % 2 ? -1 : 1, lateral, r });
   });
   if (out.length > ENV_BUDGET.MAX_ARCHES) out.length = ENV_BUDGET.MAX_ARCHES;
@@ -469,20 +669,29 @@ export function planScrub(cum: number[], o: EnvResolved): Scrub[] {
     next = cum[i] + o.scrubStep;
     for (const side of [1, -1]) {
       n++;
-      const w = 1 + hash01(12004 + n * 5) * 1.6;
-      out.push({
-        idx: i,
-        side,
-        // Scrub crowns used to overlap the guardrail line; the crown extent
-        // now clears the rail outer face.
-        lateral: Math.max(
-          o.halfW + 3.5 + hash01(11003 + n * 3) * 4.5,
-          o.halfW + CORRIDOR.SCRUB_OUT + scrubExtent(w),
-        ),
-        w,
-        h: Math.min(0.8 + hash01(13005 + n * 7) * 0.8, SIGHTLINE.MAX_SCRUB_H),
-        tint: n,
-      });
+      // Sparse clusters: deterministic open gaps break the repeating-fence
+      // read, and every plant varies in width/height so no two shrubs match.
+      const roll = hash01(11011 + n * 7 + (side > 0 ? 0 : 91));
+      if (roll < 0.25) continue;
+      const cluster = roll > 0.72 ? 2 : 1;
+      for (let c = 0; c < cluster; c++) {
+        const m = n * 5 + c * 131;
+        const w = 0.7 + hash01(12004 + m) * 1.7;
+        // Cluster mate sits a little further out (never inward, never over the
+        // rail): keeps the raw clearance contract.
+        const outward = c === 0 ? 0 : 0.9;
+        out.push({
+          idx: i,
+          side,
+          lateral: Math.max(
+            o.halfW + 3.5 + hash01(11003 + m) * 3.0 + outward,
+            o.halfW + CORRIDOR.SCRUB_OUT + scrubExtent(w),
+          ),
+          w,
+          h: Math.min(0.35 + hash01(13005 + m) * 1.25, SIGHTLINE.MAX_SCRUB_H),
+          tint: m,
+        });
+      }
     }
   }
   if (out.length > ENV_BUDGET.MAX_SCRUB) out.length = ENV_BUDGET.MAX_SCRUB;
@@ -506,16 +715,16 @@ export interface ResolvedEnv {
 
 function minDistXZ(
   track: TrackData, x: number, z: number,
-  outNearest: { x: number; z: number },
+  outNearest: { x: number; y: number; z: number; i: number },
 ): number {
-  let best = Infinity, bx = x, bz = z;
+  let best = Infinity, bx = x, by = 0, bz = z, bi = -1;
   const pts = track.points;
   for (let k = 0; k < pts.length; k++) {
     const dx = x - pts[k].x, dz = z - pts[k].z;
     const d = Math.sqrt(dx * dx + dz * dz);
-    if (d < best) { best = d; bx = pts[k].x; bz = pts[k].z; }
+    if (d < best) { best = d; bx = pts[k].x; by = pts[k].y; bz = pts[k].z; bi = k; }
   }
-  outNearest.x = bx; outNearest.z = bz;
+  outNearest.x = bx; outNearest.y = by; outNearest.z = bz; outNearest.i = bi;
   return best;
 }
 
@@ -531,7 +740,7 @@ export function enforceCorridor(
 ): ResolvedEnv {
   const need = corridorNeed(halfW);
   const scrubNeed = halfW + CORRIDOR.SCRUB_OUT;
-  const nearPt = { x: 0, z: 0 };
+  const nearPt = { x: 0, y: 0, z: 0, i: -1 };
   const posOf = (idx: number, side: number, lateral: number): { x: number; z: number } => {
     const p = track.points[idx], nrm = track.normals[idx];
     return { x: p.x + nrm.x * side * lateral, z: p.z + nrm.z * side * lateral };
@@ -559,20 +768,48 @@ export function enforceCorridor(
   }
   const keptMesas: Mesa[] = [];
   for (const b0 of mesas) {
-    if (b0.haze > 0) { keptMesas.push(b0); continue; } // horizon ring
+    if (b0.haze > 0) {
+      // Horizon ring: keep every butte CENTER at a stable, separated depth from
+      // the whole course (not just its bbox center) so compact fixed courses
+      // never get a giant butte looming over the launch. No re-anchoring: the
+      // ring base stays below ground by construction.
+      let hx = b0.x, hz = b0.z;
+      for (let pass = 0; pass < RESOLVE_PASSES; pass++) {
+        const md = minDistXZ(track, hx, hz, nearPt);
+        if (md >= HORIZON_CLEAR) break;
+        const push = HORIZON_CLEAR - md + 1;
+        let dx = hx - nearPt.x, dz = hz - nearPt.z;
+        const len = Math.sqrt(dx * dx + dz * dz);
+        if (len < 1e-6) { dx = 1; dz = 0; } else { dx /= len; dz /= len; }
+        hx += dx * push; hz += dz * push;
+      }
+      keptMesas.push({ ...b0, x: hx, z: hz });
+      continue;
+    }
     let bx = b0.x, bz = b0.z;
     const ext = mesaExtent(b0.w, mesaDepth(b0.tint, b0.w));
     let okBody = false;
     for (let pass = 0; pass < RESOLVE_PASSES; pass++) {
       const md = minDistXZ(track, bx, bz, nearPt);
-      if (md >= need + ext) { okBody = true; break; }
-      const push = need + ext - md + 0.5;
+      // The launch vista rule keys off the NEAREST centerline station, not the
+      // placing station: on a course that curves back near the start, a body
+      // placed after OPENING_LEN can still crowd the opening. Require the
+      // opening separation against whichever sample is actually nearest.
+      const opening = track.cum && nearPt.i >= 0 && track.cum[nearPt.i] < OPENING_LEN;
+      const req = opening ? Math.max(need + ext, OPENING_MIN_LATERAL) : need + ext;
+      if (md >= req) { okBody = true; break; }
+      const push = req - md + 0.5;
       let dx = bx - nearPt.x, dz = bz - nearPt.z;
       const len = Math.sqrt(dx * dx + dz * dz);
       if (len < 1e-6) { dx = 1; dz = 0; } else { dx /= len; dz /= len; }
       bx += dx * push; bz += dz * push;
     }
-    if (okBody) keptMesas.push({ ...b0, x: bx, z: bz });
+    if (okBody) {
+      // Re-anchor to the ground under the FINAL (possibly pushed) position so
+      // a body pushed onto lower grade can never hover.
+      const y = Math.min(b0.y, nearPt.y - ENV_BASE_DROP);
+      keptMesas.push({ ...b0, x: bx, y, z: bz });
+    }
   }
   const keptArches: Arch[] = [];
   for (const a0 of arches) {
@@ -625,7 +862,7 @@ export function auditCorridor(
   let checked = 0;
   const need = corridorNeed(o.halfW);
   const scrubNeed = o.halfW + CORRIDOR.SCRUB_OUT;
-  const nearPt = { x: 0, z: 0 };
+  const nearPt = { x: 0, y: 0, z: 0, i: -1 };
   const r = enforceCorridor(
     track,
     planWalls(track.cum, events, o),
@@ -952,7 +1189,7 @@ export function mountEnvironment(
       q.setFromEuler(eu);
       v.set(
         p.x + nrm.x * a.side * a.lateral,
-        p.y + a.r * 0.9,
+        archCenterY(p.y, a.r),
         p.z + nrm.z * a.side * a.lateral,
       );
       sv.set(a.r, a.r * 1.2, a.r);

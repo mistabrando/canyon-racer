@@ -19,98 +19,113 @@ export type Seg =
 
 export const TRACK_HALF_W = 11.5; // 23u total: inside/late-apex/outside drift lines
 export const DS = 2; // centerline sample spacing
-export const LEN_MIN = 2400, LEN_MAX = 3650;
+// Length cap bounds run duration, not asphalt: at the 140-cruise pace 3850u
+// runs ~32s, the same experience the 3650 cap gave at 112.
+export const LEN_MIN = 2400, LEN_MAX = 3850;
 export const FIRST_MIN = 140, FIRST_MAX = 240;
 export const CLEAR_MIN = 40; // widened with the road: 2*halfW (23) + margin
 export const GRADE_MAX = 0.30;
 export const MAX_ATTEMPTS = 40;
-// Measured-event quotas for the 12-corner grammar (drift 45-130u: five big
-// 110-128u hug arcs plus one 48-60u decreasing challenge; sweeper 130-175u;
-// kink 175u+ by median radius).
+// Measured-event quotas for the 12-corner grammar (drift 45-130u: two
+// 72-86u hairpins, three 62-78u tight 90s, three 90-120u committed arcs plus
+// one 78-85u decreasing challenge; sweeper 130-175u; kink 175u+ by median
+// radius). Hairpins read as U-turns by ANGLE (150-170deg) at a radius the
+// 112 drift cap holds with margin (78*1.9=148); tight 90s are the radius
+// challenge (62-78u needs real braking from cruise).
 export const EVENT_MIN = 11, EVENT_MAX = 14;
-export const DRIFT_MIN = 5, DRIFT_MAX = 7;
-export const SWEEP_MIN = 3, SWEEP_MAX = 4;
+// Trackmania grammar (see docs/agents/trackmania-courses.md): hairpins,
+// tight 90s and committed arcs dominate; fast sweepers/kink are the minority
+// so the course is not a gentle cruise. Drift class = medR 45-130.
+export const DRIFT_MIN = 8, DRIFT_MAX = 10;
+export const SWEEP_MIN = 2, SWEEP_MAX = 3;
 
-// Canonical grammar: 12 corner events over ~2480 units — 5 drift hairpins,
-// 1 decreasing-radius complex (counts as drift), 4 fast sweepers, 3 kinks —
-// with S-transitions throughout, a balanced L/R angle sum (good clearance),
-// long setup straights and two crest-host straights. Satisfies the measured
-// quotas by construction; also the bounded fallback when no seed is accepted.
-// Canonical grammar: 12 corner events over ~3350 units — 5 big drift hug
-// arcs (112-120u, 115-125deg, ~225-255u of arc), 1 decreasing-radius
-// challenge (66->38u), 4 fast sweepers (140-160u), 2 kinks (175-185u) — with
-// S-transitions throughout, a balanced L/R angle sum (good clearance), setup
-// straights, and two crest hosts (>=190u) feeding easy sweep/kink followers.
-// Satisfies the measured quotas by construction; also the bounded fallback
-// when no seed is accepted.
+// Canonical grammar: 12 corner events over ~3700 units — 2 hairpins
+// (78-80u, 158-162deg), 3 tight 90s (68-76u), 3 committed drift arcs
+// (95-115u, 105-130deg), 1 decreasing-radius challenge (80->42u), 2 fast
+// sweepers (145-165u), 1 kink (185u) — with S-transitions on short reversal
+// links, long brake links before the hairpins, a balanced L/R angle sum (good
+// clearance), setup straights and two crest hosts (>=240u) feeding easy
+// sweeper followers. Satisfies the measured quotas by construction; also the
+// bounded fallback when no seed is accepted.
 export function canonicalGrammar(): Seg[] {
   const C = (dir: TurnDir, r0: number, r1: number, angleDeg: number): Seg =>
     ({ kind: 'corner', corner: { dir, r0, r1, angleDeg } });
   const S = (len: number): Seg => ({ kind: 'straight', len });
+  // Two long 240u straights double as crest hosts and hairpin brake zones;
+  // each feeds an easy follower (sweep/kink), keeping crest runoff valid.
+  // Short 85-95u reversal links keep S-transitions alive between linked
+  // corners; the 140/130u links are brake+settle zones before slow corners.
   return [
-    S(175),
-    C('R', 145, 145, 45),
-    S(50),
-    C('L', 116, 116, 120),
-    S(45),
-    C('R', 118, 118, 125),
-    S(50),
-    C('L', 150, 150, 48),
-    S(55),
-    C('R', 66, 38, 92),
+    S(180),
+    C('R', 150, 150, 48),
+    S(90),
+    C('L', 100, 100, 118),
+    S(90),
+    C('R', 72, 72, 96),
+    S(140),
+    C('L', 78, 78, 162),
+    S(95),
+    C('R', 108, 108, 122),
+    S(240),
+    C('L', 155, 155, 44),
+    S(85),
+    C('R', 76, 76, 100),
+    S(90),
+    C('L', 112, 112, 120),
+    S(130),
+    C('R', 80, 42, 96),
+    S(240),
+    C('L', 185, 185, 28),
+    S(90),
+    C('R', 80, 80, 158),
+    S(85),
+    C('L', 98, 98, 112),
     S(190),
-    C('L', 155, 155, 45),
-    S(50),
-    C('R', 112, 112, 115),
-    S(185),
-    C('L', 188, 188, 28),
-    S(50),
-    C('R', 120, 120, 120),
-    S(55),
-    C('L', 140, 140, 50),
-    S(50),
-    C('R', 186, 186, 30),
-    S(55),
-    C('L', 118, 118, 118),
-    S(150),
   ];
 }
 
-// Corner archetype deck for seeded daily grammars: 5 big drift hug-arcs +
-// 1 decreasing challenge + 4 sweepers + 2 kinks = 12 events. Ordinary drift
-// arcs run 110-128u over 100-135deg, i.e. ~190-300u of centerline arc — long
-// sustained slides with room to hug the inside curb. Entered above grip pace
-// they still demand drift (full-lock grip radius at top speed is ~133u, and
-// the hug line runs a tighter radius than centerline). Bands sit inside the
-// measured classes (drift 45-130, sweep 130-175, kink 175+) with margin so
-// sampling noise cannot push an event across a class boundary.
+// Corner archetype deck for seeded daily grammars: 1 hairpin (U-turn) + 2
+// tight 90s + 5 committed drift arcs + 1 decreasing challenge + 2 fast
+// sweepers + 1 kink = 12 events. A daily keeps one U-turn and a pair of 90s so
+// every lap has a punish-hot-entry corner without becoming a wall of hairpins:
+// at the 140u/s envelope a lap of five sub-90u corners is rail-grazing on every
+// run, which is unfair rather than demanding. Bands sit inside the measured
+// classes (drift 45-130, sweep 130-175, kink 175+) with margin so sampling
+// noise cannot push an event across a class boundary (tight floor 62u vs the 45
+// boundary; hairpins sit mid-band).
 interface CornerArch {
-  cls: 'drift' | 'dec' | 'sweep' | 'kink';
+  cls: 'hairpin' | 'drift' | 'dec' | 'tight' | 'sweep' | 'kink';
   rMin: number; rMax: number; aMin: number; aMax: number;
 }
 const DECK: CornerArch[] = [
-  { cls: 'drift', rMin: 110, rMax: 128, aMin: 100, aMax: 135 },
-  { cls: 'drift', rMin: 110, rMax: 128, aMin: 100, aMax: 135 },
-  { cls: 'drift', rMin: 110, rMax: 128, aMin: 100, aMax: 135 },
-  { cls: 'drift', rMin: 110, rMax: 128, aMin: 100, aMax: 135 },
-  { cls: 'drift', rMin: 110, rMax: 128, aMin: 100, aMax: 135 },
-  { cls: 'dec', rMin: 62, rMax: 70, aMin: 85, aMax: 100 },
-  { cls: 'sweep', rMin: 132, rMax: 168, aMin: 35, aMax: 55 },
-  { cls: 'sweep', rMin: 132, rMax: 168, aMin: 35, aMax: 55 },
-  { cls: 'sweep', rMin: 132, rMax: 168, aMin: 35, aMax: 55 },
-  { cls: 'sweep', rMin: 132, rMax: 168, aMin: 35, aMax: 55 },
-  { cls: 'kink', rMin: 180, rMax: 198, aMin: 24, aMax: 34 },
-  { cls: 'kink', rMin: 180, rMax: 198, aMin: 24, aMax: 34 },
+  { cls: 'hairpin', rMin: 72, rMax: 86, aMin: 150, aMax: 170 },
+  { cls: 'drift', rMin: 90, rMax: 120, aMin: 100, aMax: 135 },
+  { cls: 'tight', rMin: 62, rMax: 78, aMin: 85, aMax: 110 },
+  { cls: 'tight', rMin: 62, rMax: 78, aMin: 85, aMax: 110 },
+  { cls: 'drift', rMin: 90, rMax: 120, aMin: 100, aMax: 135 },
+  { cls: 'drift', rMin: 90, rMax: 120, aMin: 100, aMax: 135 },
+  { cls: 'drift', rMin: 90, rMax: 120, aMin: 100, aMax: 135 },
+  { cls: 'drift', rMin: 90, rMax: 120, aMin: 100, aMax: 135 },
+  { cls: 'dec', rMin: 78, rMax: 85, aMin: 88, aMax: 102 },
+  { cls: 'sweep', rMin: 145, rMax: 170, aMin: 40, aMax: 55 },
+  { cls: 'sweep', rMin: 145, rMax: 170, aMin: 40, aMax: 55 },
+  { cls: 'kink', rMin: 180, rMax: 200, aMin: 24, aMax: 32 },
 ];
 
-// Setup straight before a corner of the given class: long enough to brake
-// and pick a line, short enough (<=110 with the transition rule) to keep
-// S-transitions alive. Crest hosts are floored separately.
+// Setup straight before a corner of the given class: long enough to brake,
+// settle and pick a line at 140 u/s (a crossed-up slide needs ~1s/130u to
+// catch), short enough that the course stays dense. Hairpins get full
+// brake+settle zones (140 -> ~100); tight/drift/dec entries get firm zones;
+// sweep/kink entries stay fast. Reversal links are pinned short separately
+// below (chained slides need no brake room).
 function setupLen(cls: CornerArch['cls'], rng: () => number): number {
-  if (cls === 'sweep') return 50 + rng() * 12;
-  if (cls === 'kink') return 45 + rng() * 12;
-  if (cls === 'drift') return 55 + rng() * 12;
-  return 45 + rng() * 12;
+  if (cls === 'hairpin') return 130 + rng() * 30;
+  if (cls === 'tight') return 115 + rng() * 25;
+  if (cls === 'dec') return 110 + rng() * 25;
+  if (cls === 'drift') return 110 + rng() * 25;
+  if (cls === 'sweep') return 65 + rng() * 20;
+  if (cls === 'kink') return 60 + rng() * 20;
+  return 100 + rng() * 25;
 }
 
 // Per-(day, attempt) deterministic grammar: shuffled archetype order (easy
@@ -124,10 +139,12 @@ export function grammarForAttempt(day: string, attempt: number): Seg[] {
   const rng = mulberry32(hashSeed(`canyon-${day}#${attempt}`));
   const pick = <T>(arr: T[]): T => arr[Math.floor(rng() * arr.length)];
   // Order: slot 0 opens on a sweeper, slot 11 closes on sweep/kink,
-  // the decreasing complex sits mid-pack (slots 2..9).
+  // the decreasing complex and both hairpins sit mid-pack (slots 2..9) so the
+  // cold opening and the finish stay fast.
   const sweeps = DECK.map((a, k) => (a.cls === 'sweep' ? k : -1)).filter((k) => k >= 0);
   const closers = DECK.map((a, k) => (a.cls === 'sweep' || a.cls === 'kink' ? k : -1)).filter((k) => k >= 0);
   const decIdx = DECK.findIndex((a) => a.cls === 'dec');
+  const hairIdx = DECK.map((a, k) => (a.cls === 'hairpin' ? k : -1)).filter((k) => k >= 0);
   const rest = DECK.map((_, k) => k);
   const take = (pool: number[], choices: number[]): number => {
     const c = pick(choices);
@@ -140,6 +157,15 @@ export function grammarForAttempt(day: string, attempt: number): Seg[] {
   const decSlot = 2 + Math.floor(rng() * 8);
   order[decSlot] = decIdx;
   rest.splice(rest.indexOf(decIdx), 1);
+  // Hairpins take two more mid-pack slots (never 0/11, never the dec slot).
+  for (const h of hairIdx) {
+    let slot = 2 + Math.floor(rng() * 8);
+    let guard = 0;
+    while (order[slot] >= 0 && guard++ < 20) slot = 2 + Math.floor(rng() * 8);
+    if (order[slot] >= 0) slot = order.indexOf(-1);
+    order[slot] = h;
+    rest.splice(rest.indexOf(h), 1);
+  }
   // Shuffle the remainder over the leftover slots.
   const open = order.map((v, k) => (v < 0 ? k : -1)).filter((k) => k >= 0);
   for (let k = open.length - 1; k >= 0; k--) {
@@ -162,7 +188,7 @@ export function grammarForAttempt(day: string, attempt: number): Seg[] {
     for (let k = 0; k < 12; k++) net += (dirs[k] === 'L' ? 1 : -1) * midAngle(k);
     return net;
   };
-  for (let t = 0; t < 24 && Math.abs(netAngle()) > 50 * Math.PI / 180; t++) {
+  for (let t = 0; t < 32 && Math.abs(netAngle()) > 40 * Math.PI / 180; t++) {
     const k = 1 + Math.floor(rng() * 10);
     const before = Math.abs(netAngle());
     dirs[k] = dirs[k] === 'L' ? 'R' : 'L';
@@ -171,49 +197,68 @@ export function grammarForAttempt(day: string, attempt: number): Seg[] {
   if (!dirs.includes('L')) dirs[5] = 'L';
   if (!dirs.includes('R')) dirs[6] = 'R';
   const segs: Seg[] = [];
-  segs.push({ kind: 'straight', len: 155 + rng() * 20 });
+  segs.push({ kind: 'straight', len: 165 + rng() * 25 });
   const midIdx: number[] = [];
   for (let k = 0; k < 12; k++) {
     const a = archOf(k);
     const r0 = a.rMin + rng() * (a.rMax - a.rMin);
     const ang = a.aMin + rng() * (a.aMax - a.aMin);
     const corner: CornerSpec = a.cls === 'dec'
-      ? { dir: dirs[k], r0, r1: Math.max(30, r0 * (0.5 + rng() * 0.08)), angleDeg: ang }
-      : { dir: dirs[k], r0, r1: Math.max(30, r0 + (rng() * 8 - 4)), angleDeg: ang };
+      ? { dir: dirs[k], r0, r1: Math.max(32, r0 * (0.5 + rng() * 0.08)), angleDeg: ang }
+      : { dir: dirs[k], r0, r1: Math.max(32, r0 + (rng() * 8 - 4)), angleDeg: ang };
     segs.push({ kind: 'corner', corner });
     if (k < 11) {
       midIdx.push(segs.length);
       segs.push({ kind: 'straight', len: setupLen(archOf(k + 1).cls, rng) });
     }
   }
-  segs.push({ kind: 'straight', len: 150 + rng() * 20 });
-  // Decreasing complex gets clean links: entry >= 80 keeps the entry-third
-  // measurement uncontaminated, exit >= 95 doubles as runoff for the slow
-  // exit (smoothing bleeds curvature ~28u into short links).
-  // Reversal setup: a drift/dec corner after an opposite-direction corner
-  // needs room to cross to the new outside line and initiate cleanly — a
-  // 50u link at 75u/s is 0.7s for the switch plus the tap, which spins
-  // pursuit-line drivers at the second entry. Floor those links to 85-95
-  // (still <= 110, so S-transitions keep counting).
+  segs.push({ kind: 'straight', len: 175 + rng() * 30 });
+  // Decreasing complex gets clean links: entry >= 110 keeps the entry-third
+  // measurement uncontaminated, exit >= 120 doubles as runoff for the slow
+  // exit (smoothing bleeds curvature ~28u into short links). Hairpins get
+  // full brake+settle links (>= 130) for the 140 -> ~100 shed.
+  // Reversal setup: a drift/dec/tight/hairpin corner after an
+  // opposite-direction corner needs room to cross to the new outside line and
+  // initiate cleanly — a 50u link at 110u/s is 0.5s for the switch plus the
+  // tap, which spins pursuit-line drivers at the second entry. Floor those
+  // links to 85-95 (still <= 110, so S-transitions keep counting).
   const decPos = order.indexOf(decIdx);
   const linkBefore = decPos === 0 ? 0 : midIdx[decPos - 1];
   const linkAfter = decPos === 11 ? segs.length - 1 : midIdx[decPos];
-  const needs: [number, number][] = [[linkBefore, 80], [linkAfter, 95]];
+  const needs: [number, number][] = [[linkBefore, 110], [linkAfter, 120]];
+  for (const h of hairIdx) {
+    const hp = order.indexOf(h);
+    if (hp > 0) needs.push([midIdx[hp - 1], 130]);
+  }
   for (let h = 0; h < 11; h++) {
     const nxt = archOf(h + 1);
-    if (nxt.cls !== 'drift' && nxt.cls !== 'dec') continue;
+    if (nxt.cls === 'hairpin') continue; // chained entries into hairpins stay long (brake!)
+    if (nxt.cls !== 'drift' && nxt.cls !== 'dec' && nxt.cls !== 'tight') continue;
     if (dirs[h + 1] === dirs[h]) continue; // compound flows need no switch room
     needs.push([midIdx[h], 85]);
+  }
+  // Linked reversals (non-hairpin) are chained as one slide: pin those links
+  // SHORT (85-95, S-transition range) even when setupLen gave more — a chained
+  // slide carries through, and short links keep the transition quota alive.
+  // Hairpin/dec-brake links set above are never shortened.
+  const shortPinned = new Set<number>();
+  for (let h = 0; h < 11; h++) {
+    const nxt = archOf(h + 1);
+    if (nxt.cls === 'hairpin' || nxt.cls === 'dec') continue;
+    if (nxt.cls !== 'drift' && nxt.cls !== 'tight') continue;
+    if (dirs[h + 1] === dirs[h]) continue;
+    shortPinned.add(midIdx[h]);
   }
   for (const [li, need] of needs) {
     const st = segs[li];
     if (st.kind === 'straight' && st.len < need) st.len = need + rng() * 10;
   }
-  // Two seeded mid-pack crest hosts floored to >=195 (landing + runoff room).
-  // Hosts must feed an easy follower: only straights leading into a
-  // sweeper/kink corner qualify (landing at full speed). Launches must also
-  // start from a settled line: prefer straights after sweeper/kink exits, so
-  // the car never jumps 40u after a big drift exit still carrying slide.
+  // Two seeded mid-pack crest hosts floored to HOST_MIN_LEN (landing +
+  // runoff room at the new pace). Hosts must feed an easy follower: only
+  // straights leading into a sweeper/kink corner qualify (landing at full
+  // speed). Launches must also start from a settled line: prefer straights
+  // after sweeper/kink exits, so the car never jumps 40u after a big drift
+  // exit still carrying slide.
   const easyHost = midIdx.filter((_, h) => {
     const next = archOf(h + 1).cls;
     return next === 'sweep' || next === 'kink';
@@ -229,7 +274,14 @@ export function grammarForAttempt(day: string, attempt: number): Seg[] {
   while (h2 === h1) h2 = pool[Math.floor(rng() * pool.length)];
   for (const li of [h1, h2]) {
     const sg = segs[li];
-    if (sg.kind === 'straight' && sg.len < 180) sg.len = 180 + rng() * 15;
+    if (sg.kind === 'straight' && sg.len < HOST_MIN_LEN) sg.len = HOST_MIN_LEN + rng() * 20;
+  }
+  // Pin linked-reversal links short (chained slides carry through). Crest
+  // host links are exempt so the runway survives.
+  for (const li of shortPinned) {
+    if (li === h1 || li === h2) continue;
+    const st = segs[li];
+    if (st.kind === 'straight' && st.len > 95) st.len = 85 + rng() * 10;
   }
   // Guarantee at least two S-transitions: count flips across short links
   // from the assembled segments, flipping same-direction junctions only
@@ -289,11 +341,20 @@ export function buildCenterline(segs: Seg[], crestPick: number): BuiltTrack {
   return buildCenterlineSeeded(segs, crestPick, defaultElevation(), [0.3, 0.55, 0.8]);
 }
 
+// Crest runway: at cruise 140 a 13 m/s launch covers ~140u, so a crest must
+// sit at least this far before the host straight ends to leave a
+// straightforward landing before the next corner demands a drift.
+export const CREST_RUNWAY = 205;
+export const CREST_AMP = 4.5;
+export const HOST_MIN_LEN = 245;
+
 export function buildCenterlineSeeded(
   segs: Seg[],
   crestPick: number,
   elev: ElevationParams,
   landmarkFracs: number[],
+  crestAmp: number = CREST_AMP,
+  hostCount: number = 2,
 ): BuiltTrack {
   type Raw = { x: number; z: number; s: number };
   const raw: Raw[] = [{ x: 0, z: 0, s: 0 }];
@@ -328,13 +389,13 @@ export function buildCenterlineSeeded(
   const mids = straightRanges.slice(1, -1)
     .map((r, k) => ({ r, len: r.b - r.a, k }))
     .sort((a, b) => b.len - a.len);
-  const hosts = [mids[0].r, mids[1].r];
-  // Place each crest ~150 units before its host straight ends so flight
-  // (60-70u) plus 60u of settling runoff fit before the next corner entry,
-  // with margin for the analyzer's smoothing bleed (~28u) at corner entries.
-  // Hosts are floored to >=195u in grammarForAttempt, so this stays >=40u
-  // past the host start.
-  const crestS = hosts.map((h) => Math.min(h.b - 150 - (crestPick % 3) * 5, h.b - 150)).map((cs, k) => Math.max(cs, hosts[k].a + 40));
+  const hosts = mids.slice(0, Math.max(1, Math.min(hostCount, mids.length))).map((x) => x.r);
+  // Place each crest CREST_RUNWAY before its host straight ends so a short hop
+  // plus settling runway fits before the next corner.
+  const crestS = hosts.map((h, k) => Math.max(
+    h.b - CREST_RUNWAY - (crestPick % 3) * 5,
+    h.a + 40,
+  ));
   const sstep = (a: number, b: number, x: number): number => {
     const u = clamp((x - a) / (b - a), 0, 1);
     return u * u * (3 - 2 * u);
@@ -349,7 +410,7 @@ export function buildCenterlineSeeded(
     y = lerp(y, 7, sstep(L - 260, L - 140, ss));
     for (const cs of crestS) {
       const d = (ss - cs) / 18;
-      y += 4.5 * Math.exp(-d * d);
+      y += crestAmp * Math.exp(-d * d);
     }
     return y;
   };
@@ -516,9 +577,21 @@ export function checksumPoints(points: Pt3[]): string {
   return (h >>> 0).toString(16);
 }
 
-// Rough clean-lap estimate from the measured envelope: lateral-accel-capped
-// speed profile (48 grip / 95 drift, drift cap applied through r<=130) with
-// 50 accel / 70 decel passes.
+// Clean-lap estimate from the frozen Trackmania envelope: cruise 140, drift
+// cap 112 through the drift band (r<=130), grip lateral accel ~122 (grip
+// radius ~160 at 140), drift-band lateral accel ~212 (112^2/59 hairpin hold),
+// with 130 accel / 100 decel passes. Matches MAX_GRIP_SPEED /
+// MAX_DRIFT_SPEED; re-derive if the physics envelope changes.
+export const EST_CRUISE = 140;
+export const EST_DRIFT_CAP = 112;
+export const EST_SURGE = 162;
+// Validity band for estimateCleanTime over accepted tracks. The estimator
+// models near-optimal envelope pace for the current car (cruise EST_CRUISE,
+// grip aLat 122 / drift aLat 212), so a clean accepted track lands ~29-31s.
+// The gate catches degenerate pace (a broken grammar that is all-straight or
+// all-hairpin) with ~7s margin either side; it is NOT a human-lap band
+// (targets are est x 1.10/1.22/1.40 in course-reference).
+export const EST_MIN_S = 26, EST_MAX_S = 38;
 export function estimateCleanTime(points: Pt3[]): number {
   const n = points.length;
   const s: number[] = [0];
@@ -535,18 +608,21 @@ export function estimateCleanTime(points: Pt3[]): number {
     while (dh > Math.PI) dh = 2 * Math.PI - dh;
     const ds = Math.max(s[b] - s[a], 1e-6);
     const r = ds / Math.max(dh, 1e-6);
-    const aLat = r <= 130 ? 95 : 48;
-    vt.push(Math.min(80, Math.sqrt(aLat * Math.min(r, 1e6))));
+    // Drift band (r<=130) caps at the drift top; grips above it scale with the
+    // grip lateral accel (122) up to cruise.
+    const cap = r <= 130 ? EST_DRIFT_CAP : EST_CRUISE;
+    const aLat = r <= 130 ? 212 : 122;
+    vt.push(Math.min(cap, Math.sqrt(aLat * Math.min(r, 1e6))));
   }
   const v = vt.slice();
   v[0] = Math.min(v[0], 10);
   for (let m = 1; m < n; m++) {
     const ds = Math.max(s[m] - s[m - 1], 1e-6);
-    v[m] = Math.min(vt[m], Math.sqrt(v[m - 1] * v[m - 1] + 2 * 75 * ds));
+    v[m] = Math.min(vt[m], Math.sqrt(v[m - 1] * v[m - 1] + 2 * 130 * ds));
   }
   for (let m = n - 2; m >= 0; m--) {
     const ds = Math.max(s[m + 1] - s[m], 1e-6);
-    v[m] = Math.min(v[m], Math.sqrt(v[m + 1] * v[m + 1] + 2 * 70 * ds));
+    v[m] = Math.min(v[m], Math.sqrt(v[m + 1] * v[m + 1] + 2 * 100 * ds));
   }
   let t = 0;
   for (let m = 1; m < n; m++) {
@@ -582,7 +658,6 @@ function statsPass(stats: TrackStats, built: BuiltTrack): boolean {
   for (const cs of built.crestS) {
     const next = ev.find((e) => e.startS > cs);
     if (!next) {
-      // Crest in the final stretch: the finish straight itself is the runoff.
       if (stats.length - (cs + 65) < 60) return false;
       continue;
     }

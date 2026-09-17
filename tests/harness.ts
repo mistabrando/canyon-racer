@@ -10,11 +10,12 @@ import {
   encodeGhost, decodeGhost, sampleGhost, buildShareText, TouchState,
   TrackView, SimState, StepInput,
   interpPose, updateDisplay,
-  MAX_GRIP_SPEED,
+  MAX_GRIP_SPEED, MAX_DRIFT_SPEED,
 } from '../src/sim.js';
 import {
   acceptDailyTrack, analyzeCenterline, buildCenterline, canonicalGrammar,
-  checksumPoints, estimateCleanTime, TRACK_HALF_W,
+  checksumPoints, estimateCleanTime, TRACK_HALF_W, LEN_MIN, LEN_MAX,
+  EST_MIN_S, EST_MAX_S,
   arcLengths, markerStations,
   AcceptedTrack,
 } from '../src/trackgen.js';
@@ -321,19 +322,19 @@ function traceKey(s: SimState): string {
     const tr = wideTrack(8);
     const s = createSimState();
     resetRun(s, tr, 0);
-    let t70 = -1, top = 0;
+    let t100 = -1, top = 0;
     for (let k = 0; k < 14 / DT && !s.finished; k++) {
       const info = simStep(s, tr, drive, DT);
-      if (t70 < 0 && info.spd >= 70) t70 = s.raceMs / 1000;
+      if (t100 < 0 && info.spd >= 100) t100 = s.raceMs / 1000;
       top = Math.max(top, info.spd);
     }
-    ok(t70 > 0.6 && t70 < 1.0, 'reaches 70 in 0.6-1.0s', `t=${t70.toFixed(2)}s`);
-    ok(top >= 78 && top <= 82, 'grip top speed 78-82', `top=${top.toFixed(1)}`);
+    ok(t100 > 0.5 && t100 < 1.1, 'reaches 100 in 0.5-1.1s', `t=${t100.toFixed(2)}s`);
+    ok(top >= MAX_GRIP_SPEED - 1 && top <= MAX_GRIP_SPEED + 1, 'grip top speed at cruise', `top=${top.toFixed(1)}`);
   }
 
   // 11b. Aggressive full lock at top speed breaks into drift (intended); grip
   // lines are measured at moderate lock. Auto-drift converges to the handbrake
-  // drift state (~43u radius).
+  // drift state (~59u radius at the 140/112 envelope: 112/1.9).
   {
     const tr = wideTrack(400);
     const s = createSimState();
@@ -348,7 +349,7 @@ function traceKey(s: SimState): string {
     }
     const w = wSum / n, v = vSum / n, r = v / w;
     ok(tDrift >= 0 && tDrift <= 1.2, 'full lock at top speed breaks into drift', `t=${tDrift.toFixed(2)}s`);
-    ok(r > 35 && r < 55, 'auto-drift converges to drift radius', `r=${r.toFixed(0)}`);
+    ok(r > 48 && r < 68, 'auto-drift converges to drift radius', `r=${r.toFixed(0)}`);
     const g = createSimState();
     resetRun(g, tr, 0);
     settleRun(tr, g, 8, drive);
@@ -360,7 +361,7 @@ function traceKey(s: SimState): string {
     }
     const gw = gwSum / gn, gv = gvSum / gn;
     ok(held, 'moderate lock at top speed holds grip');
-    ok(gw > 0.2 && gw < 0.4 && gv > 75, 'moderate grip line is fast and wide', `w=${gw.toFixed(2)} v=${gv.toFixed(0)}`);
+    ok(gw > 0.4 && gw < 0.9 && gv > 85, 'moderate grip line is fast and wide', `w=${gw.toFixed(2)} v=${gv.toFixed(0)}`);
   }
 
   // 11c. Controlled drift: radius 35-50, slip 12-28 degrees once settled.
@@ -447,7 +448,7 @@ function traceKey(s: SimState): string {
       const i = simStep(d, tr, { steer: 0.2, drift: true }, DT);
       if (k * DT > 5) driftTop = Math.max(driftTop, i.spd);
     }
-    ok(driftTop >= 72 && driftTop <= 76 && driftTop < MAX_GRIP_SPEED, 'drift top 72-76, never a boost', `top=${driftTop.toFixed(1)}`);
+    ok(driftTop >= MAX_DRIFT_SPEED - 4 && driftTop <= MAX_DRIFT_SPEED + 1 && driftTop < MAX_GRIP_SPEED, 'drift top just under the drift cap, never a boost', `top=${driftTop.toFixed(1)}`);
   }
 
   // 11h. Wall penalties: solid hits cost 15-30%, grinding bleeds speed.
@@ -480,10 +481,11 @@ function traceKey(s: SimState): string {
     let gSum = 0, gN = 0;
     for (let k = 0; k < 1 / DT && !s.finished; k++) { const r = simStep(s, tr, { steer: 0.6, drift: false }, DT); gSum += r.spd; gN++; }
     const gAvg = gSum / Math.max(gN, 1), gAdv = s.lastIdx - g0;
-    // Bouncy wall: leaning rattles along at ~half speed and crawls forward,
-    // never pinned to a stop and never competitive with clean road (~79/79).
-    ok(gAvg > 15 && gAvg < 55, 'grinding rattles at punished pace (bounce, never free)', `${v0.toFixed(0)}->avg${gAvg.toFixed(1)}`);
-    ok(gAdv < 30, 'grinding barely advances (wall-riding never pays)', `adv=${gAdv}`);
+    // Bouncy wall: leaning rattles along at punished pace (~48% of the 140
+    // cruise, measured ~67) and crawls forward, never pinned to a stop and
+    // never competitive with clean road.
+    ok(gAvg > 15 && gAvg < MAX_GRIP_SPEED * 0.55, 'grinding rattles at punished pace (bounce, never free)', `${v0.toFixed(0)}->avg${gAvg.toFixed(1)}`);
+    ok(gAdv < MAX_GRIP_SPEED * 0.55 / 2, 'grinding barely advances (wall-riding never pays)', `adv=${gAdv}`);
   }
 
   // 11i. Offroad bites immediately and recovers slowly.
@@ -544,12 +546,12 @@ function traceKey(s: SimState): string {
   const quotas = (a: AcceptedTrack): string[] => {
     const bad: string[] = [];
     const st = a.stats, ev = st.events;
-    if (st.length < 2400 || st.length > 3650) bad.push(`len=${st.length.toFixed(0)}`);
+    if (st.length < LEN_MIN || st.length > LEN_MAX) bad.push(`len=${st.length.toFixed(0)}`);
     if (ev.length < 11 || ev.length > 14) bad.push(`nev=${ev.length}`);
     const drift = ev.filter((e) => e.medR >= 45 && e.medR <= 130);
-    if (drift.length < 5 || drift.length > 7) bad.push(`drift=${drift.length}`);
+    if (drift.length < 8 || drift.length > 10) bad.push(`drift=${drift.length}`);
     const sweep = ev.filter((e) => e.medR > 130 && e.medR <= 175);
-    if (sweep.length < 3 || sweep.length > 4) bad.push(`sweep=${sweep.length}`);
+    if (sweep.length < 2 || sweep.length > 3) bad.push(`sweep=${sweep.length}`);
     if (!ev.some((e) => e.dir === 'L') || !ev.some((e) => e.dir === 'R')) bad.push('one-sided');
     let transitions = 0;
     for (let k = 1; k < ev.length; k++) {
@@ -591,7 +593,7 @@ function traceKey(s: SimState): string {
     if (!a.fallback) ok(a.attempt < 40, `accepted within attempts ${day}`, `att=${a.attempt}`);
     else ok(quotas(a).length === 0, `fallback still satisfies quotas ${day}`);
     if (a.estTimeS > worstEst) { worstEst = a.estTimeS; slowestDay = day; }
-    ok(a.estTimeS > 34 && a.estTimeS < 47, `estimate sane ${day}`, `${a.estTimeS.toFixed(1)}s`);
+    ok(a.estTimeS > EST_MIN_S && a.estTimeS < EST_MAX_S, `estimate sane ${day}`, `${a.estTimeS.toFixed(1)}s`);
   }
   console.log(`slowest profile estimate: ${slowestDay} ${worstEst.toFixed(1)}s`);
 
@@ -962,8 +964,11 @@ function traceKey(s: SimState): string {
   }
 }
 
-// 14b. gripBound: a pure-pursuit no-drift daily run stays within est+25% with
-// negligible drift engagement (drift margin must keep paying).
+// 14b. gripBound: a pure-pursuit no-drift daily run stays within est+40% with
+// negligible drift engagement (drift margin must keep paying). The 40% band is
+// calibrated to the tight grammar (hairpins/90s): a no-drift line cannot hold a
+// sub-100u radius at speed, so it scrubs and runs wide, worst case ~1.29x est
+// over 42 sampled days (gain 1.5). Old 25% fit the wide-sweep grammar only.
 {
   const today = new Date();
   const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
@@ -982,8 +987,9 @@ function traceKey(s: SimState): string {
     while (ang > Math.PI) ang -= 2 * Math.PI;
     while (ang < -Math.PI) ang += 2 * Math.PI;
     // Gentle pursuit: yanked full lock trips autoBreak slides; a smooth
-    // no-drift line stays under the thresholds (measured 0.00% engagement).
-    const steer = Math.max(-1, Math.min(1, -ang * 1.2));
+    // no-drift line stays under the thresholds (measured <1.1% engagement).
+    // Gain 1.5 holds the tighter hairpin lines; 1.2 ran wide and burned time.
+    const steer = Math.max(-1, Math.min(1, -ang * 1.5));
     const info = simStep(q, tr, { steer, drift: false }, DT);
     total++;
     if (info.drifting) driftSteps++;
@@ -995,7 +1001,7 @@ function traceKey(s: SimState): string {
   }
   const autoS = q.raceMs / 1000;
   ok(q.finished, 'gripBound no-drift daily finishes', `${autoS.toFixed(1)}s`);
-  ok(autoS <= a.estTimeS * 1.25, 'gripBound within est+25%', `est=${a.estTimeS.toFixed(1)} auto=${autoS.toFixed(1)}`);
+  ok(autoS <= a.estTimeS * 1.40, 'gripBound within est+40%', `est=${a.estTimeS.toFixed(1)} auto=${autoS.toFixed(1)}`);
   ok(driftSteps / Math.max(total, 1) < 0.02, 'gripBound drift engagement <2%', `${(100 * driftSteps / Math.max(total, 1)).toFixed(2)}%`);
 }
 

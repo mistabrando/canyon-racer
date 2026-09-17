@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "tsc -p tsconfig.tests.json && node test-dist/tests/harness.js && node test-dist/tests/physics-feel.js && node test-dist/tests/ghost-share.js && node test-dist/tests/visuals-budget.js && node test-dist/tests/render-motion.js && node test-dist/tests/drift-control.js && node test-dist/tests/track-variance.js && node test-dist/tests/loop-ui.js && node test-dist/tests/trails-bounds.js && node test-dist/tests/barrier-plan.js && node test-dist/tests/barrier-edge.js && node test-dist/tests/corner-apex.js"
+    "test": "tsc -p tsconfig.tests.json && node test-dist/tests/harness.js && node test-dist/tests/physics-feel.js && node test-dist/tests/ghost-share.js && node test-dist/tests/visuals-budget.js && node test-dist/tests/render-motion.js && node test-dist/tests/drift-control.js && node test-dist/tests/track-variance.js && node test-dist/tests/loop-ui.js && node test-dist/tests/retry-restart.js && node test-dist/tests/trails-bounds.js && node test-dist/tests/barrier-plan.js && node test-dist/tests/barrier-edge.js && node test-dist/tests/corner-apex.js && node test-dist/tests/audio.js && node test-dist/tests/driving-feedback.js && node test-dist/tests/courses.js"
   },
   "dependencies": {
     "three": "^0.170.0"

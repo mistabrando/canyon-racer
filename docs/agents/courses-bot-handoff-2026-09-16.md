@@ -89,16 +89,28 @@ assertions have been brought up to the new deck; what remains is controller qual
      Recovery steering is NOT the bottleneck: both the heading-align and a
      pursuit-toward-road rescue produced byte-identical results, because the outcome is
      set by the bot's own line policy after the 3s rescue window.
-   - Reward lines: `exitQuality` is ALWAYS 0, and the cause is now pinned. Instrumented
-     against `s.rhythm` directly: the module's OWN slip signal `peakSlipDeg` is only
-     **0.4deg** at entry (vs 6.6deg velocity-vs-heading), the slide never develops past
-     `scoreExit`'s 3deg gate, and it terminates by **RESET to `idle`** (`slideAge` 0.00s,
-     `peakSlipDeg` 0.0, `lastQuality` 0.000) — not by a scored commit. Why it resets: the
-     scripted line leaves the road, `worstLat` = **58-75u against halfW 11.5** (measured at
-     entry speeds 96/108/118/126/132). A slide only lives on normal ground, so departing
-     the road wipes it; that also explains the `walls=1` per line. Harder yanks
-     (steer 0.9) do not help. Fixing this means replacing the crude `follow()` line in
-     section 10 with a real controller — the same fix as the other two failures.
+   - Reward lines: root-caused and FIXED. RETRACTION: the earlier entry here claimed the
+     module's `peakSlipDeg` only reached 0.4deg and that the scripted line left the road
+     by 58-75u. Both came from a hand-made probe that did NOT replicate section 10's
+     script, and both are wrong. A faithful replica shows `peakSlipDeg` develops normally
+     (9-20deg) and the real excursion is only 11.72-11.73 vs halfW 11.5.
+     Real cause: `sim.ts` feeds the rhythm module the RATE-LIMITED `s.steer`
+     (`s.steer += clamp(steer - s.steer, -sRate*dt, sRate*dt); const steerEff = s.steer`),
+     and the module records `entryDir` from that value at the handbrake's rising edge. The
+     old script flipped its command and tapped on the SAME step, so `entryDir` was captured
+     from the still-lagging slew (measured `entryDir=-1` while the script assumed
+     `dirS=+1`). Every later sign was therefore inverted: phase 2's `follow()*0.7` WAS the
+     commit direction, so the slide committed at `age=0.15` where the age gate is still
+     zero, earning `q=0`. Fix (in `tests/corner-apex.ts` section 10): hold the entry
+     command until the slew settles onto `dirS`, then tap; make the "small correction" an
+     out-and-back blip so it returns to the same line; push the late exit to `endS+30`.
+     Result: corner-apex 63/12 -> 72/3.
+   - Rejected on the way (all measured, none worked): clamping phase-2 steer magnitude
+     (car cannot hold the corner; runs off-road 50-66 steps), sign-locking phase 2 to the
+     entry direction (no-op - the commit rides the slewed `steerEff`, not the raw command),
+     and entry-timing offsets (+20/60/100/140) or fractions (0.55-0.85) of the corner,
+     which are seed-sensitive because the three seeds' corners differ in length (188u,
+     248u, 193u).
 
 ## Best-known bot config (`tests/informed-bot.ts`, shared)
 crash-memory tiers (112/95/80), catch-first at |slip|>0.6, engaged gate, true

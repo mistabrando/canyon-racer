@@ -498,7 +498,7 @@ function botRun(day: string): { t: number; finished: boolean; walls: number; res
     s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading;
     let walls = 0, minSpd = Infinity, exitSpd: number | null = null;
     let entered = 0, rewards = 0, bestQ = 0, lastPh = 'idle';
-    let phase = 0, tapLeft = 0, blip = 0, corrDone = false, exitHold = 0;
+    let phase = 0, tapLeft = 0, blip = 0, back = 0, corrDone = false, exitHold = 0, settleLeft = 0;
     for (let k = 0; k < Math.floor(25 / DT) && s.lastIdx < endIdx; k++) {
       const sM = tr.cum[s.lastIdx];
       const spd = Math.hypot(s.vx, s.vz);
@@ -507,10 +507,18 @@ function botRun(day: string): { t: number; finished: boolean; walls: number; res
       let steer = follow(s, tr, off);
       let drift = false;
       if (phase === 0) {
-        if (Math.abs(steer) > 0.25 && spd > 32) { phase = 1; tapLeft = 6; }
+        if (Math.abs(steer) > 0.25 && spd > 32) { phase = 1; tapLeft = 6; settleLeft = 8; }
         else { steer = follow(s, tr, off); }
       }
-      if (phase === 1) { steer = dirS * 0.4; drift = tapLeft > 0; tapLeft--; if (tapLeft <= 0) phase = 2; }
+      if (phase === 1) {
+        // Hold entry steer until the rate-limited s.steer (sim.ts steerEff) has
+        // settled onto dirS: tapping while the slew still lags records the wrong
+        // entryDir, inverting every later sign so the first phase-2 correction
+        // commits at age ~0.15 where the scoring gate is still zero.
+        steer = dirS * 0.4;
+        if (settleLeft > 0) { settleLeft--; drift = false; }
+        else { drift = tapLeft > 0; tapLeft--; if (tapLeft <= 0) phase = 2; }
+      }
       else if (phase === 2) {
         // Slide is held on the entry line until the exit trigger: the drift cap
         // (90) is below the grip cruise (112), so a sustained slide is what
@@ -518,8 +526,12 @@ function botRun(day: string): { t: number; finished: boolean; walls: number; res
         steer = follow(s, tr, off) * 0.7;
         drift = true;
         if (variant === 'correct' && !corrDone && sM > e.startS + 60) { blip = 3; corrDone = true; }
-        if (blip > 0) { steer = -dirS * 0.4; blip--; }
-        if (sM >= (variant === 'late' ? e.endS + 10 : e.endS - 5)) { phase = 3; exitHold = 12; }
+        // Out-and-back: returning to the same line is what makes the correction
+        // cost nothing (a one-sided blip shifts the endS+40 exit speed).
+        if (blip > 0) { steer = -dirS * 0.4; blip--; if (blip <= 0) back = 3; }
+        else if (back > 0) { steer = dirS * 0.4; back--; }
+        // Late exit must land far enough past the optimal window to earn less.
+        if (sM >= (variant === 'late' ? e.endS + 30 : e.endS - 5)) { phase = 3; exitHold = 12; }
       } else if (phase === 3) { steer = -dirS * 0.4; drift = false; if (--exitHold <= 0) phase = 4; }
       else { steer = follow(s, tr, 0); }
       const info = simStep(s, tr, { steer, drift }, DT);

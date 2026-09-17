@@ -180,10 +180,16 @@ Refuted mechanisms (all measured — do not repeat): stuck-detector threshold (n
 300 -> 600/900/1500; 07-11 unaffected because its respawns are all the `oob` branch);
 persistent recovery steering (walls 2 -> 9); bearing-based rejoin (walls 2 -> 11, 07-11
 collapsed to cum 444); endless-slide from the scrub (`slideSteps` +16% on a regressed seed
-vs +243% on an improved one); the module yaw kick (the kick-free handbrake-less yank, which
-gave `slideSteps=0`, was the WORST at 2/8); launch suppression itself. Crest-scrub modes 1-5:
-the best (deficit-scaled, CG=60) DOES fix both seeds but REGRESSES 4 previously-passing seeds
-(4/8 vs the 6/8 baseline) — so it was rejected and deliberately NOT committed.
+vs +243% on an improved one); the module yaw kick (the kick-free handbrake-less yank gave
+`slideSteps=0` and scored 2/8); "car-state-at-crest" (vetoing the handbrake inside the crest
+window while KEEPING the bot's own steering scored 0/8 — every previously-passing seed then
+failed with 16-21 respawns); and launch suppression itself.
+
+Across the 8 wired seeds the trend is monotonic and decisive: the more a crest-specific
+override suppresses the bot's normal policy, the worse it scores — baseline 6/8, deficit-scaled
+scrub 4/8, kick-free yank 2/8, handbrake-veto 0/8. The bot's ordinary behaviour around crests
+is therefore already correct, and ANY crest override corrupts it. Nine strategies and seven
+refuted mechanisms in total; all were rejected and deliberately NOT committed.
 
 `courses` C7 additionally requires ZERO walls AND ZERO respawns on >= 4 of 8 seeds
 (`tests/courses.ts:301,308`). It is currently 0/8 and no seed reaches 0/0: even the six that

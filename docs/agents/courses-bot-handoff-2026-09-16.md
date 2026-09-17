@@ -151,18 +151,62 @@ wiredFail 2/8, daily 4/8 finish 0/8 clean.
 | **adaptive look-ahead** (`L = min(12+0.7*spd, rPeek*K+B)`), K/B swept | **net regression**: benchmark w=1 at every K/B; wiredFail 2 -> 4-6; only K=0.6/B=20 nudged daily finish to 5/8 |
 | reverting the speed caps to 112/90 (diagnostic) | daily walls drop to 1/day but still 0/8 clean, and the fixed courses break (practice resp 25) |
 
-Conclusion: no local tuning of the current policy closes the gap. The bottleneck is the
-controller's line-holding at 140 u/s through sub-90u corners; fixing it needs a real
-racing-line controller (apex-seek + curvature-adaptive speed), not constants.
+Conclusion: no local tuning of the current policy closes the gap. NOTE (2026-09-17): the
+earlier claim here — that the bottleneck is line-holding at 140 u/s through sub-90u corners
+and needs a "racing-line controller" — was DISPROVED. The shared bot already carries
+curvature-adaptive speed (`holdV`/`vth` in `tests/informed-bot.ts`); see the crest
+investigation below for the measured real cause.
+
+## Crest investigation (section 5 pair + courses C7) — do not redo
+The two remaining wired failures (2026-06-01, 2026-07-11) and `courses` C7 share ONE root
+cause: `resolveCourse('daily', d).track` is byte-identical to `acceptDailyTrack(d)` (same
+lengths and `crestS`; 06-01 shares crest 3351.07 across both suites).
+
+Measured facts (via `.omo/probe-wired.mjs`, `.omo/probe-crestv.mjs`, `.omo/probe-landing.mjs`):
+- The car reaches 87-96% of the track, then LOOPS at a pinned sM until the sim cap (not a
+  stall). Coarse trace: airborne (`gnd=n`) at ~140 u/s, landing at lat 26-130 vs halfW 11.5.
+- `v_launch = sqrt(LAUNCH_FOLLOW / -kappaV) = 33.7 u/s` at the worst crest of EVERY daily
+  track — below the drift cap (112) and the bot's cautious tier (80). Crests therefore launch
+  at ANY realistic speed: a designed, universal, mostly-survivable mechanic (6 of 8 wired
+  seeds pass). Suppressing it is the wrong goal and is why every scrub below regressed.
+- A ballistic ~70u flight from the centreline lands `lat ~ 0.0` (on-track) at EVERY crest of
+  EVERY seed: the launch and flight geometry are correct. The 2 failures are car-STATE at the
+  crest (observed mid-drift at the 112 u/s drift cap, whose slip rotates the flight vector).
+- `StepInput = { steer, drift }` (src/sim.ts:236): no brake, no throttle. The handbrake only
+  acts once a drift engages (`wantDrift` needs `|steerEff| >= 0.18`, src/sim.ts:454), so the
+  harness cannot shed speed on a straight at all.
+
+Refuted mechanisms (all measured — do not repeat): stuck-detector threshold (noProg
+300 -> 600/900/1500; 07-11 unaffected because its respawns are all the `oob` branch);
+persistent recovery steering (walls 2 -> 9); bearing-based rejoin (walls 2 -> 11, 07-11
+collapsed to cum 444); endless-slide from the scrub (`slideSteps` +16% on a regressed seed
+vs +243% on an improved one); the module yaw kick (the kick-free handbrake-less yank, which
+gave `slideSteps=0`, was the WORST at 2/8); launch suppression itself. Crest-scrub modes 1-5:
+the best (deficit-scaled, CG=60) DOES fix both seeds but REGRESSES 4 previously-passing seeds
+(4/8 vs the 6/8 baseline) — so it was rejected and deliberately NOT committed.
+
+`courses` C7 additionally requires ZERO walls AND ZERO respawns on >= 4 of 8 seeds
+(`tests/courses.ts:301,308`). It is currently 0/8 and no seed reaches 0/0: even the six that
+finish comfortably carry 1-6 wall contacts.
+
+`small corrections cost nothing 2026-09-07` (section 10) is over-tight as written: the 0.5 u/s
+exit-speed tolerance sits below the measurement's sensitivity — a single-step, 0.2-magnitude
+steer blip 500u earlier shifts the exit speed by 2.5 u/s through boost timing. No blip
+configuration passes all three days.
+
+Conclusion: the crest pair is NOT fixable harness-side. It needs a brake in `StepInput`,
+gentler crest launches, or different crest placement — all shipped-physics/TrackGen changes,
+i.e. a product decision rather than a test-tuning task.
 
 ## Next steps (priority order)
-1. `tests/corner-apex.ts` section 10: rewrite the scripted drift timing (commit the
-   countersteer while the module is still `sliding`, i.e. within ~0.3s of the tap)
-   so a scored exit actually fires.
-2. `tests/corner-apex.ts` section 5 + `tests/courses.ts` daily sample: give the
-   controller a real racing line (apex-seek on entry/exit) so the tightest generated
-   corners are holdable at 140 u/s. This is the single fix behind both red suites.
-   Alternatives if a better controller is out of scope: ease the deck's tightest
-   radii, or accept the assertion as a documented known limit of the test controller.
+1. `tests/corner-apex.ts` section 10: DONE (commit `efb0246`). Fixed by settling the entry
+   steer before the handbrake tap so the module records the correct `entryDir` — the old
+   script tapped on the same step it flipped its command, capturing the rate-limited slew
+   (`entryDir=-1` while the script assumed `dirS=+1`) and inverting every later sign.
+   corner-apex 63/12 -> 72/3.
+2. `tests/corner-apex.ts` section 5 (2026-06-01, 2026-07-11) + `tests/courses.ts` C7 daily
+   sample: NOT a line-holding problem — see the crest investigation above. Requires a
+   shipped-physics decision (brake input / gentler crests / crest placement). Options if that
+   is out of scope: relax the over-tight assertions, or accept them as documented limits.
 3. `.omo/probe-*.mjs` are scratch diagnostics; safe to delete.
 

@@ -22,6 +22,12 @@ export const ACCEL_ROAD = 110; // softened ~21%: launch less violent, cruise (MA
 // pre-softening punch while their window is live, so timed-exit surge
 // dynamics are unchanged and only plain launch/drive accel is gentler.
 export const ACCEL_BOOST_MAKEUP = 30;
+// Launch ramp: plain on-road accel is speed-dependent so the standing start
+// punches less hard, rising to the full ACCEL_ROAD value by LAUNCH_RAMP_END.
+// Live boost windows (rhythm/exit slingshot) bypass the ramp, so timed-exit
+// surge dynamics stay bit-identical and only the launch ramp changes.
+export const LAUNCH_RAMP_MIN = 0.55;
+export const LAUNCH_RAMP_END = 60;
 export const ACCEL_OFFROAD = 16; // dirt: reduced forward traction, still recoverable
 export const MAX_GRIP_SPEED = 140;
 export const MAX_DRIFT_SPEED = 112;
@@ -578,7 +584,11 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     const upset = s.crashT > 0 ? Math.min(Math.abs(s.crashAmp) / CRASH_WOBBLE, 1) : 0;
     const exitBoost = rhythmBoost > 0 ? 0 : (s.exitT > 0 ? EXIT_BOOST_ACCEL : 0);
     const boostMakeup = !offroad && (rhythmBoost > 0 || s.exitT > 0) ? ACCEL_BOOST_MAKEUP : 0;
-    const accel = (offroad ? ACCEL_OFFROAD : ACCEL_ROAD + boostMakeup + exitBoost + rhythmBoost) * (1 - CRASH_ACCEL_CUT * upset);
+    const boostLive = rhythmBoost > 0 || s.exitT > 0;
+    const launchRamp = !offroad && !boostLive
+      ? LAUNCH_RAMP_MIN + (1 - LAUNCH_RAMP_MIN) * Math.min(Math.max(fSpeed, 0) / LAUNCH_RAMP_END, 1)
+      : 1;
+    const accel = (offroad ? ACCEL_OFFROAD : ACCEL_ROAD * launchRamp + boostMakeup + exitBoost + rhythmBoost) * (1 - CRASH_ACCEL_CUT * upset);
     if (fSpeed < maxSp) fSpeed = Math.min(maxSp, fSpeed + accel * dt);
     // Cycle 7: boost overshoot bleeds back toward grip top once every boost
     // has expired, so the slingshot is a surge (not a permanent +4 cruise).

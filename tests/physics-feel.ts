@@ -15,6 +15,7 @@ import {
   REAR_LOOSEN_GAIN, REAR_LOOSEN_MAX, COUNTER_GRIP_BOOST,
   SCRUB_COUNTER_RELIEF, EXIT_BOOST_ACCEL, EXIT_BOOST_TIME, EXIT_SLIP_MAX,
 WALL_MARGIN, CRASH_UPSET_TIME, WALL_CLAMP_REACH, ACCEL_ROAD, ACCEL_BOOST_MAKEUP,
+  LAUNCH_RAMP_MIN, LAUNCH_RAMP_END,
   SNAP_RAIL_CLEAR, SNAP_MAX_HEAD_ERR, SNAP_HISTORY, SNAP_MIN_SPD,
   SNAP_RESUME_AHEAD } from '../src/sim.js';
 import { BOOST_SPEED_CAP } from '../src/drift-control.js';
@@ -1616,11 +1617,14 @@ const settle = (tr: TrackView, s: SimState, secs: number, inp: StepInput) => {
   };
 
   // OT1. Off-road pitch follows the surface, not the distant road grade.
+  // 2026-09-18 road-relative surface: the dirt parallels the road height, so
+  // off-road pitch now reads the road grade (0.0798 on the 8% slopeTrack)
+  // instead of dead level — the old 0.0000 assumed the absolute flat plain.
   {
     const tr = openPlan(slopeTrack());
     const s = parkOut(tr, 60, 40);
     const info = simStep(s, tr, drive, DT);
-    ok(Math.abs(info.pitch) < 0.02, 'OT1 far-offroad pitch reads level on the plain', `pitch=${info.pitch.toFixed(4)}`);
+    ok(Math.abs(info.pitch - Math.atan(0.08)) < 0.02, 'OT1 far-offroad pitch parallels the road grade', `pitch=${info.pitch.toFixed(4)}`);
     const g = createSimState(); resetRun(g, tr, 100);
     for (let k = 0; k < 30; k++) simStep(g, tr, drive, DT);
     const j = g.lastIdx;
@@ -1629,7 +1633,7 @@ const settle = (tr: TrackView, s: SimState, secs: number, inp: StepInput) => {
     ok(Math.abs(g.pitch - Math.atan(grade)) < 1e-9, 'OT1 on-road pitch still tracks road grade');
     const v = parkOut(tr, tr.halfW + 9, 40);
     const vi = simStep(v, tr, drive, DT);
-    ok(vi.pitch > 0 && vi.pitch < Math.atan(0.08), 'OT1 verge pitch banks between plain and road', `pitch=${vi.pitch.toFixed(4)}`);
+    ok(Math.abs(vi.pitch - Math.atan(0.08)) < 0.02, 'OT1 verge pitch parallels the road grade', `pitch=${vi.pitch.toFixed(4)}`);
   }
 
   // OT2. No lateral snap far off the road on railed plans; legacy still clamps.
@@ -1694,6 +1698,47 @@ const settle = (tr: TrackView, s: SimState, secs: number, inp: StepInput) => {
     ok(t100 > 0.70 && t100 < 1.00, 'OT4 time-to-100 softened', `t=${t100.toFixed(2)}s (was 0.65)`);
     ok(t140 > 1.00 && t140 < 1.50, 'OT4 time-to-140 softened but prompt', `t=${t140.toFixed(2)}s (was 0.93)`);
     ok(top >= MAX_GRIP_SPEED - 1 && top <= MAX_GRIP_SPEED + 1, 'OT4 cruise still reaches 140', `top=${top.toFixed(1)}`);
+  }
+
+  // OT6. Progressive launch ramp (2026-09-18): plain on-road accel is
+  // speed-dependent (soft punch off the line, full ACCEL_ROAD by
+  // LAUNCH_RAMP_END), while a live boost window is bit-identical to before.
+  {
+    ok(LAUNCH_RAMP_MIN === 0.55 && LAUNCH_RAMP_END === 60, 'OT6 ramp shape pinned', `min=${LAUNCH_RAMP_MIN} end=${LAUNCH_RAMP_END}`);
+    const tr = wideTrack(8);
+    const s = createSimState(); resetRun(s, tr, 0);
+    let t40 = -1;
+    for (let k = 0; k < 20 / DT && !s.finished; k++) {
+      const info = simStep(s, tr, drive, DT);
+      if (t40 < 0 && info.spd >= 40) t40 = s.raceMs / 1000;
+    }
+    // Measured 0.27s pre-ramp (constant 110 from a 10 u/s start); the ramp
+    // stretches the standing-start pull without touching the top end.
+    ok(t40 > 0.30 && t40 < 0.50, 'OT6 0-to-40 progressive, not punchy', `t=${t40.toFixed(2)}s (was 0.27)`);
+    // First-step punch at the start speed: 110 * ramp(10) / 60 per step.
+    const g = createSimState(); resetRun(g, tr, 0);
+    const before = Math.hypot(g.vx, g.vz);
+    simStep(g, tr, drive, DT);
+    const gain = (Math.hypot(g.vx, g.vz) - before) * 60;
+    const expect = ACCEL_ROAD * (LAUNCH_RAMP_MIN + (1 - LAUNCH_RAMP_MIN) * 10 / LAUNCH_RAMP_END);
+    ok(Math.abs(gain - expect) < 0.5, 'OT6 launch accel follows the ramp at low speed', `gain=${gain.toFixed(1)} (ramp=${expect.toFixed(1)}, flat=110)`);
+    // Live boost windows bypass the ramp: exit surge at low speed gains
+    // exactly ACCEL_ROAD + MAKEUP + EXIT_BOOST per second, as before.
+    const e = createSimState(); resetRun(e, tr, 0);
+    for (let k = 0; k < 30; k++) simStep(e, tr, drive, DT);
+    e.exitT = 0.5;
+    const eb = Math.hypot(e.vx, e.vz);
+    simStep(e, tr, drive, DT);
+    const eGain = (Math.hypot(e.vx, e.vz) - eb) * 60;
+    ok(Math.abs(eGain - (ACCEL_ROAD + ACCEL_BOOST_MAKEUP + EXIT_BOOST_ACCEL)) < 1e-6, 'OT6 exit window bit-identical under the ramp', `gain=${eGain.toFixed(4)}`);
+    // Same for the rhythm slingshot window.
+    const r = createSimState(); resetRun(r, tr, 0);
+    for (let k = 0; k < 30; k++) simStep(r, tr, drive, DT);
+    r.rhythm.boostT = 0.5; r.rhythm.boostAccel = 40;
+    const rb = Math.hypot(r.vx, r.vz);
+    simStep(r, tr, drive, DT);
+    const rGain = (Math.hypot(r.vx, r.vz) - rb) * 60;
+    ok(Math.abs(rGain - (ACCEL_ROAD + ACCEL_BOOST_MAKEUP + 40)) < 1e-6, 'OT6 rhythm window bit-identical under the ramp', `gain=${rGain.toFixed(4)}`);
   }
 
   // OT5. Spin stays free off-road: a big slide is never damped into a stop,

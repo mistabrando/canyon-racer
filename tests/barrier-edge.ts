@@ -9,7 +9,7 @@ import {
   BACKSTOP_RADIUS, OOB_ARM_MS, OOB_EXTRA_LAT, RESPAWN_PENALTY_MS,
 } from '../src/sim.js';
 import type { SimState, StepInput, TrackView } from '../src/sim.js';
-import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.js';
+import { DIRT_VERGE_DROP, DIRT_VERGE_WIDTH, groundSurfaceY, offroadLevel } from '../src/surface.js';
 import { barrierAt, planBarriers } from '../src/barrier-plan.js';
 import type { BarrierPlan } from '../src/barrier-plan.js';
 import { planGuardrails, resolveOptions } from '../src/visuals.js';
@@ -106,7 +106,9 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   ok(s.grounded && airSteps === 0, 'dirt plain supports the car (no bottomless fall)', `air=${airSteps}`);
   const lat = latOf(s, tr);
   const surf = groundSurfaceY(tr.y[s.lastIdx], lat, tr.halfW);
-  ok(Math.abs(surf - DIRT_PLAIN_Y) < 1e-9, 'far off course rests on the flat plain', `surf=${surf}`);
+  // 2026-09-18 road-relative surface: far-out dirt holds the apron level
+  // beside the road (roadY - DROP), not the legacy absolute floor.
+  ok(Math.abs(surf - offroadLevel(tr.y[s.lastIdx])) < 1e-9, 'far off course rests on the road-relative apron level', `surf=${surf}`);
   ok(Math.abs(s.py - (surf + 0.2)) < 1e-6, 'car sits on the rendered surface', `py=${s.py.toFixed(2)}`);
   console.log(`[measure] open-edge maxLat=${maxLat.toFixed(1)} grounded=${s.grounded} py=${s.py.toFixed(2)}`);
 }
@@ -212,11 +214,40 @@ function placeCurveOut(s: SimState, tr: TrackView, idx: number, lat: number, vLa
   const info = simStep(s, tr, drive, DT);
   ok(s.grounded && info.offroad, 'verge is offroad and supported');
   const surf = groundSurfaceY(tr.y[s.lastIdx], latOf(s, tr), HALF);
-  ok(surf < tr.y[s.lastIdx] && surf > DIRT_PLAIN_Y, 'verge sits between road and plain', `surf=${surf.toFixed(2)}`);
+  // 2026-09-18 road-relative surface: the verge blends roadY down to the
+  // apron level (roadY - DROP), a ~1.5u bank instead of an 8-19u embankment.
+  ok(surf < tr.y[s.lastIdx] && surf >= offroadLevel(tr.y[s.lastIdx]), 'verge sits between road and apron level', `surf=${surf.toFixed(2)}`);
   ok(Math.abs(s.py - (surf + 0.2)) < 1e-6, 'verge snaps to the blended surface', `py=${s.py.toFixed(2)}`);
   placeOut(s, tr, 200, PLAIN_LAT, 0, 40); // far out on the plain
   simStep(s, tr, drive, DT);
-  ok(s.grounded && Math.abs(s.py - (DIRT_PLAIN_Y + 0.2)) < 1e-6, 'plain supports the car at plain height', `py=${s.py.toFixed(2)}`);
+  ok(s.grounded && Math.abs(s.py - (offroadLevel(tr.y[s.lastIdx]) + 0.2)) < 1e-6, 'apron supports the car at apron level', `py=${s.py.toFixed(2)}`);
+}
+
+// 6b. Off-road ground tracks the road height (2026-09-18): anywhere in the
+// wide driveable dirt the surface is within DROP of the neighbouring road
+// height — no 8-19u embankment — and a parked car grounds exactly on it, so
+// physics and render (which samples the same function per vertex) agree.
+{
+  const tr = straight();
+  tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
+  let maxDrop = 0;
+  for (let zi = 0; zi < tr.n; zi += 13) {
+    for (const dd of [0, 2, 5, 10, 18, 30, 45, 60, 90, 150]) {
+      for (const sd of [1, -1]) {
+        const surf = groundSurfaceY(tr.y[zi], sd * (HALF + dd), HALF);
+        maxDrop = Math.max(maxDrop, Math.abs(surf - tr.y[zi]));
+      }
+    }
+  }
+  ok(maxDrop <= DIRT_VERGE_DROP + 1e-9, 'dirt beside the road stays within DROP of road height', `maxDrop=${maxDrop.toFixed(3)}`);
+  const s = createSimState();
+  resetRun(s, tr, 0);
+  for (const lat of [HALF + 5, HALF + 30, HALF + 90]) {
+    placeOut(s, tr, 200, lat, 0, 40);
+    simStep(s, tr, drive, DT);
+    const surf = groundSurfaceY(tr.y[s.lastIdx], latOf(s, tr), HALF);
+    ok(s.grounded && Math.abs(s.py - (surf + 0.2)) < 1e-6, 'parked car grounds exactly on the shared surface', `lat=${lat} py=${s.py.toFixed(2)}`);
+  }
 }
 
 // 7. Respawn after going OOB on the plain: snapshot + exact 3s gap, OOB cleared.

@@ -15,6 +15,7 @@
 
 import type * as THREE from 'three';
 import { indexAtS } from './visuals.js';
+import { groundSurfaceY } from './surface.js';
 import type { CornerEventLike, ThreeKit, TrackData } from './visuals.js';
 
 export interface EnvKit extends ThreeKit {
@@ -78,8 +79,9 @@ export function groundPlainCovers(cameraFar: number): boolean {
  * Expansive dirt-plain footprint from the full course bounds with a generous
  * margin, so the horizon reads as one flat plain instead of a finite floor and
  * no course point sits near a visible ground edge. Square, centered on the
- * course bounding box; the renderer places the plane at the shared
- * `DIRT_PLAIN_Y` height from ./surface.ts.
+ * course bounding box; the renderer rides the plane at the shared
+ * road-relative apron level (`offroadLevel` from ./surface.ts) under the car,
+ * so the per-station apron always meets the far field with no embankment.
  */
 export function groundPlainBounds(pts: { x: number; y: number; z: number }[], margin = 1200): GroundPlainBounds {
   if (pts.length === 0) return { cx: 0, cz: 0, size: margin * 2, minY: 0, maxY: 0 };
@@ -1218,7 +1220,10 @@ export function mountEnvironment(
       q.setFromEuler(eu);
       v.set(
         p.x + nrm.x * s.side * s.lateral,
-        p.y - 0.1,
+        // Scrub sits on the shared dirt surface, which now follows the road
+        // height instead of an absolute floor: sample it so shrubs planted on
+        // the banked verge never hover above the raised dirt.
+        groundSurfaceY(p.y, s.side * s.lateral, o.halfW) - 0.1,
         p.z + nrm.z * s.side * s.lateral,
       );
       sv.set(s.w, s.h, s.w);

@@ -464,7 +464,10 @@ import {
   planScrub, planWalls, resolveEnvOptions, ridgeBlockMean, strataColor, groundPlainBounds,
   GROUND_PLAIN_MIN_SIZE, GROUND_PLAIN_SNAP, groundPlainCovers,
 } from '../src/environment.js';
-import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.js';
+import {
+  DIRT_APRON_MIN, DIRT_VERGE_DROP, DIRT_VERGE_WIDTH, apronColumns, groundSurfaceY,
+  offroadLevel, resolveApronWidths,
+} from '../src/surface.js';
 
 // 9. Guardrail sightline contract (visuals.ts).
 {
@@ -1077,15 +1080,20 @@ import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.j
 
 // Surface contract + expansive dirt plain (speed/dirt presentation).
 {
-  // groundSurfaceY: exact road height on the road, flat both ends, plain beyond.
+  // groundSurfaceY: exact road height on the road, flat both ends, then the
+  // road-relative apron level (2026-09-18: the absolute -2.5 floor made every
+  // verge an 8-19u embankment beside the climbing road; the dirt now holds
+  // roadY - DROP to any lateral distance).
   const halfW = 11.5, roadY = 3.2;
   ok(groundSurfaceY(roadY, 0, halfW) === roadY, 'surface is road height on the road');
   ok(groundSurfaceY(roadY, halfW, halfW) === roadY, 'surface is road height exactly at the edge');
   ok(groundSurfaceY(roadY, -halfW, halfW) === roadY, 'surface is symmetric at the edge');
-  ok(Math.abs(groundSurfaceY(roadY, halfW + DIRT_VERGE_WIDTH, halfW) - DIRT_PLAIN_Y) < 1e-9,
-    'surface reaches the plain at the verge end');
-  ok(Math.abs(groundSurfaceY(roadY, halfW + DIRT_VERGE_WIDTH * 5, halfW) - DIRT_PLAIN_Y) < 1e-9,
-    'surface stays flat plain everywhere beyond the verge');
+  ok(Math.abs(groundSurfaceY(roadY, halfW + DIRT_VERGE_WIDTH, halfW) - offroadLevel(roadY)) < 1e-9,
+    'surface reaches apron level at the verge end');
+  ok(Math.abs(groundSurfaceY(roadY, halfW + DIRT_VERGE_WIDTH * 5, halfW) - offroadLevel(roadY)) < 1e-9,
+    'surface holds apron level everywhere beyond the verge');
+  ok(Math.abs(groundSurfaceY(roadY, halfW + 150, halfW) - offroadLevel(roadY)) < 1e-9,
+    'surface holds apron level far out (no embankment anywhere)');
   // Monotonic blend with flat (zero-slope) ends: smoothstep, never a step.
   let prev = groundSurfaceY(roadY, halfW, halfW);
   let maxStep = 0;
@@ -1094,8 +1102,8 @@ import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.j
     maxStep = Math.max(maxStep, Math.abs(y - prev));
     prev = y;
   }
-  ok(prev <= groundSurfaceY(roadY, halfW, halfW), 'verge descends from road to plain');
-  ok(maxStep <= (Math.abs(roadY - DIRT_PLAIN_Y) / DIRT_VERGE_WIDTH) * 1.5 + 1e-9,
+  ok(prev <= groundSurfaceY(roadY, halfW, halfW), 'verge descends from road to apron level');
+  ok(maxStep <= (DIRT_VERGE_DROP / DIRT_VERGE_WIDTH) * 1.5 + 1e-9,
     'verge slope is smooth (no vertical step)', `maxStep=${maxStep.toFixed(3)}`);
   const nearEdge = groundSurfaceY(roadY, halfW, halfW);
   const edgePlus = groundSurfaceY(roadY, halfW + 0.01, halfW);
@@ -1122,6 +1130,104 @@ import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from '../src/surface.j
   ok(groundPlainCovers(cameraFar), 'recentred plain always extends past camera far',
     `nearest=${(GROUND_PLAIN_MIN_SIZE / 2 - GROUND_PLAIN_SNAP / 2).toFixed(0)} >= ${cameraFar}`);
   ok(GROUND_PLAIN_MIN_SIZE >= 4 * cameraFar, 'plain min size keeps a generous frustum margin', `${GROUND_PLAIN_MIN_SIZE}`);
+}
+
+// 10b. Road-relative apron geometry (2026-09-18): tracking, physics/render
+// agreement, and the anti-folding property, verified on real daily tracks.
+{
+  const days = ['2026-09-15', '2026-09-16', '2026-09-17', '2026-09-18'];
+  let maxDrop = 0, maxDev = 0, maxFlips = 0, maxFlipArea = 0, minGap = Infinity;
+  let minW = Infinity, maxW = 0, apronTris = 0;
+  for (const day of days) {
+    const t = acceptDailyTrack(day);
+    const tr = trackFromPoints(t.points.map((p) => ({ x: p.x, y: p.y, z: p.z })), TRACK_HALF_W);
+    const n = tr.n;
+    // (a) Tracking: dirt anywhere in the wide driveable band is within DROP
+    // of the neighbouring road height — the old 8-19u embankment is gone.
+    for (let i = 0; i < n; i += 5) {
+      for (const dd of [0, 5, 10, 20, 30, 45, 60, 90, 150]) {
+        for (const sd of [1, -1]) {
+          const surf = groundSurfaceY(tr.y[i], sd * (TRACK_HALF_W + dd), TRACK_HALF_W);
+          maxDrop = Math.max(maxDrop, Math.abs(surf - tr.y[i]));
+        }
+      }
+    }
+    // Apron ribbon exactly as main.ts builds it (same shared functions, so
+    // this also pins physics/render agreement by construction).
+    const headings: number[] = [];
+    for (let i = 0; i < n; i++) headings.push(Math.atan2(tr.tx[i], tr.tz[i]));
+    const frames = [];
+    for (let i = 0; i < n; i++) frames.push({ x: tr.x[i], z: tr.z[i], nx: tr.nx[i], nz: tr.nz[i] });
+    const W = resolveApronWidths(frames, headings, tr.cum, TRACK_HALF_W);
+    for (const w of W) { if (w < minW) minW = w; if (w > maxW) maxW = w; }
+    const NC = apronColumns(W[0]).length;
+    apronTris = Math.max(apronTris, (n - 1) * (NC - 1) * 2 * 2);
+    for (const side of [1, -1]) {
+      const P: [number, number, number][][] = [];
+      for (let i = 0; i < n; i++) {
+        const cols = apronColumns(W[i]);
+        const row: [number, number, number][] = [];
+        for (const dd of cols) {
+          const lat = side * (TRACK_HALF_W + dd);
+          row.push([tr.x[i] + tr.nx[i] * lat, tr.z[i] + tr.nz[i] * lat, dd]);
+        }
+        P.push(row);
+      }
+      // (b) Agreement: the linear render interpolation between column
+      // vertices vs the physics smoothstep, sampled every 0.5u.
+      for (let i = 0; i < n; i += 7) {
+        const cols = apronColumns(W[i]);
+        for (let dd = 0; dd <= W[i] + 0.001; dd += 0.5) {
+          const lat = side * (TRACK_HALF_W + dd);
+          const phys = groundSurfaceY(tr.y[i], lat, TRACK_HALF_W);
+          let jj = 0;
+          while (jj < cols.length - 2 && cols[jj + 1] < dd) jj++;
+          const d0 = cols[jj], d1 = cols[jj + 1];
+          const y0 = groundSurfaceY(tr.y[i], side * (TRACK_HALF_W + d0), TRACK_HALF_W);
+          const y1 = groundSurfaceY(tr.y[i], side * (TRACK_HALF_W + d1), TRACK_HALF_W);
+          const rend = y0 + (y1 - y0) * ((dd - d0) / Math.max(d1 - d0, 1e-9));
+          maxDev = Math.max(maxDev, Math.abs(phys - rend));
+        }
+      }
+      // (c) Anti-fold: lateral ordering never reverses (no pass-through or
+      // overlap), and triangle windings are checked against the -side norm.
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < P[i].length - 1; j++) {
+          if (Math.abs(P[i][j + 1][2] - P[i][j][2]) < 1e-9) continue; // degenerate tail at the width floor
+          const gap = Math.hypot(P[i][j + 1][0] - P[i][j][0], P[i][j + 1][1] - P[i][j][1]);
+          if (gap < minGap) minGap = gap;
+        }
+      }
+      let flips = 0;
+      for (let i = 0; i < n - 1; i++) {
+        for (let j = 0; j < P[i].length - 1; j++) {
+          const tris = [[P[i][j], P[i][j + 1], P[i + 1][j]], [P[i][j + 1], P[i + 1][j + 1], P[i + 1][j]]];
+          for (const [a, b, c] of tris) {
+            const area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+            const sg = Math.sign(area);
+            if (sg !== 0 && sg !== -side) {
+              flips++;
+              if (Math.abs(area) > maxFlipArea) maxFlipArea = Math.abs(area);
+            }
+          }
+        }
+      }
+      if (flips > maxFlips) maxFlips = flips;
+    }
+  }
+  ok(maxDrop <= DIRT_VERGE_DROP + 1e-9, 'apron tracks the road height (no embankment)', `maxDrop=${maxDrop.toFixed(3)} (was 8-19.4)`);
+  ok(maxDev <= 0.05, 'render interp matches physics within 4cm', `maxDev=${maxDev.toFixed(4)}`);
+  ok(minGap > 0.5, 'lateral ordering never reverses (no fold-through)', `minGap=${minGap.toFixed(2)}`);
+  // Winding micro-flips are station-scale normal-discretization noise, not
+  // folds: the SHIPPED road ribbon itself flips 4x on daily-09-16 and the old
+  // 18u verge 7-38x/daily (areas <= 3.1u^2). The strip stays continuous
+  // (shared verts, DoubleSide) with ordering intact (above). Bounded here as
+  // a regression tripwire: dropping the shrink-wrap spikes to 70+/daily with
+  // 40-65u^2 folds (measured 2026-09-18).
+  ok(maxFlips <= 55, 'winding flips within shipped-noise class', `maxFlips=${maxFlips}`);
+  ok(maxFlipArea <= 3.5, 'flipped slivers stay sub-visible', `maxFlipArea=${maxFlipArea.toFixed(2)}`);
+  ok(minW >= DIRT_APRON_MIN, 'apron never narrows below the old verge', `minW=${minW.toFixed(1)}`);
+  console.log(`    [measure] apron W ${minW.toFixed(0)}..${maxW.toFixed(0)} tris~${apronTris} (was fixed 18u, ~30k tris)`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

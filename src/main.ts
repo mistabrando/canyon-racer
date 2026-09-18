@@ -33,7 +33,7 @@ import {
   trailShade, trailSpawnEvery, dustBurst, dustSpread,
 } from './visuals';
 import { createMotionState, resetMotion, updateMotion, cameraOutput, impulseLength, DEFAULT_TUNING, SPEED_FULL } from './render-motion';
-import { DIRT_PLAIN_Y, DIRT_VERGE_WIDTH, groundSurfaceY } from './surface';
+import { apronColumns, groundSurfaceY, offroadLevel, resolveApronWidths } from './surface';
 import {
   countdownLen, clearTouch, retryDisplayReset, neutralRunInfo,
   stuckPrompt, offCoursePrompt, rescuePenaltyToast, retryKey,
@@ -160,57 +160,74 @@ const splitIdx = splitPositions(courseTrack.stats.events).map((sp) => splitSampl
 let runSplits: (number | null)[] = splitIdx.map(() => null);
 let splitExpiry = 0;
 
-// ground: one expansive dirt plain (sized from the full course bounds with a
-// generous margin) plus a sloping verge ribbon that meets the road at the
-// shared ./surface.ts height. Replaces the old finite 2600 floor + mesa; there
-// is no hard ground edge or visual void anywhere near the course.
+// ground: one expansive dirt far-field (sized from the full course bounds with
+// a generous margin) plus a wide per-station apron ribbon that follows the
+// road height at the shared ./surface.ts level. The road climbs several units
+// along its length, so no single flat height can sit beside it: the apron
+// samples groundSurfaceY per vertex (exactly the surface the car drives), and
+// the far plane tracks the local road height under the car each frame, so the
+// apron edge always meets the far field with no embankment and no z-fighting.
 // The plane is also recentred on the camera in whole grid steps each frame
-// (cheap: one uniform 2-triangle mesh) so driving far onto the dirt plain can
-// never expose the plane edge inside the 2000u camera far plane.
+// (cheap: one uniform 2-triangle mesh) so driving far onto the dirt can never
+// expose the plane edge inside the 2000u camera far plane.
 let groundPlain: THREE.Mesh | null = null;
+const APRON_EDGE_COLOR = 0xbe7038;
 {
   const bounds = groundPlainBounds(courseTrack.points, 1200);
   const size = Math.max(bounds.size, GROUND_PLAIN_MIN_SIZE);
   const plain = new THREE.Mesh(
     new THREE.PlaneGeometry(size, size),
-    new THREE.MeshLambertMaterial({ color: 0xbe7038 })
+    new THREE.MeshLambertMaterial({ color: APRON_EDGE_COLOR })
   );
   plain.rotation.x = -Math.PI / 2;
-  // A hair below the shared plain height so the verge seam can never z-fight
-  // the huge plane (the sim still grounds the car on DIRT_PLAIN_Y itself).
-  plain.position.set(bounds.cx, DIRT_PLAIN_Y - 0.05, bounds.cz);
+  // A hair below the shared apron level so the apron seam can never z-fight
+  // the huge plane (the sim still grounds the car on the shared surface).
+  plain.position.set(bounds.cx, offroadLevel(pts[0].y) - 0.05, bounds.cz);
   scene.add(plain);
   groundPlain = plain;
-  // Verge: per-side ribbon sampled laterally through groundSurfaceY, so the
+  // Apron: per-side ribbon sampled laterally through groundSurfaceY, so the
   // rendered bank is exactly the surface the car drives (smoothstep from the
-  // road edge down to the plain over DIRT_VERGE_WIDTH).
+  // road edge down to apron level over DIRT_VERGE_WIDTH, then level). Each
+  // station extends to apronHalfWidth of its local curve radius: wide on
+  // straights, pinched inside hairpins so the offset strip can never reach a
+  // centre of curvature and fold (measured min daily radius ~40u).
+  const headings = pts.map((p, i) => Math.atan2(track.tx[i], track.tz[i]));
+  const apronW = resolveApronWidths(
+    pts.map((p, i) => ({ x: p.x, z: p.z, nx: normals[i].x, nz: normals[i].z })),
+    headings, cum, HALF_W,
+  );
   const verge = (side: number): THREE.Mesh => {
-    // Metres beyond the road edge, ending exactly at the shared verge width so
-    // the ribbon always meets the flat plain no matter how the width is tuned.
-    const cols = [0, 0.22, 0.5, 0.78, 1].map((f) => f * DIRT_VERGE_WIDTH);
     const n = pts.length;
-    const pos = new Float32Array(n * cols.length * 3);
-    const col = new Float32Array(n * cols.length * 3);
+    const NCOLS = apronColumns(apronW[0]).length;
+    const pos = new Float32Array(n * NCOLS * 3);
+    const col = new Float32Array(n * NCOLS * 3);
     const idx: number[] = [];
     const c = new THREE.Color();
     const near = new THREE.Color(0xc98d54);
     const far = new THREE.Color(0xa05f33);
+    const edge = new THREE.Color(APRON_EDGE_COLOR);
     for (let i = 0; i < n; i++) {
-      for (let j = 0; j < cols.length; j++) {
-        const lat = side * (HALF_W + cols[j]);
-        const k = i * cols.length + j;
+      const cols = apronColumns(apronW[i]);
+      for (let j = 0; j < NCOLS; j++) {
+        const d = cols[j];
+        const lat = side * (HALF_W + d);
+        const k = i * NCOLS + j;
         pos.set([
           pts[i].x + normals[i].x * lat,
           groundSurfaceY(pts[i].y, lat, HALF_W),
           pts[i].z + normals[i].z * lat,
         ], k * 3);
-        c.copy(near).lerp(far, Math.min(1, cols[j] / DIRT_VERGE_WIDTH));
+        // Bank palette (near -> far) easing into the far-field colour at the
+        // edge so the apron meets the huge plane with no visible tone step.
+        const f = Math.min(1, d / Math.max(apronW[i], 1e-6));
+        if (f < 0.7) c.copy(near).lerp(far, f / 0.7);
+        else c.copy(far).lerp(edge, (f - 0.7) / 0.3);
         col.set([c.r, c.g, c.b], k * 3);
       }
       if (i < n - 1) {
-        for (let j = 0; j < cols.length - 1; j++) {
-          const a = i * cols.length + j, b = a + 1;
-          const d = (i + 1) * cols.length + j, e = d + 1;
+        for (let j = 0; j < NCOLS - 1; j++) {
+          const a = i * NCOLS + j, b = a + 1;
+          const d = (i + 1) * NCOLS + j, e = d + 1;
           idx.push(a, b, d, b, e, d);
         }
       }
@@ -1226,6 +1243,11 @@ function recenterGround() {
   if (!groundPlain) return;
   groundPlain.position.x = Math.round(camera.position.x / GROUND_SNAP) * GROUND_SNAP;
   groundPlain.position.z = Math.round(camera.position.z / GROUND_SNAP) * GROUND_SNAP;
+  // The road height varies along the course, so the flat far field rides at
+  // the shared apron level under the car: the seam where the apron ribbon
+  // ends always meets the plane within road-grade of the car.
+  const li = Math.min(Math.max(sim.lastIdx | 0, 0), track.n - 1);
+  groundPlain.position.y = offroadLevel(track.y[li]) - 0.05;
 }
 function renderScene() {
   recenterGround();

@@ -278,6 +278,7 @@ export interface SimState {
   driftHold: number; exitT: number;
   rhythm: DriftState; rhythmOut: DriftStepOut; rhythmExitLatch: number;
   justLaunched: boolean; airSteps: number;
+  launchRampArmed: boolean;
 }
 
 export function createSimState(): SimState {
@@ -294,6 +295,7 @@ export function createSimState(): SimState {
     driftHold: 0, exitT: 0,
     rhythm: createDriftState(), rhythmOut: createDriftOut(), rhythmExitLatch: 0,
     justLaunched: false, airSteps: 0,
+    launchRampArmed: true,
   };
 }
 
@@ -388,6 +390,7 @@ export function resetRun(s: SimState, tr: TrackView, i0: number) {
   s.driftHold = 0; s.exitT = 0;
   resetDrift(s.rhythm); s.rhythmOut = createDriftOut(); s.rhythmExitLatch = 0;
   s.justLaunched = false; s.airSteps = 0; s.oobMs = 0;
+  s.launchRampArmed = true;
   const g0 = (tr.y[Math.min(i0 + 1, tr.n - 1)] - tr.y[Math.max(i0 - 1, 0)]) / distXZ(tr, Math.max(i0 - 1, 0), Math.min(i0 + 1, tr.n - 1));
   s.pitch = Math.atan(clamp(g0, -0.5, 0.5));
   s.px0 = s.px; s.py0 = s.py; s.pz0 = s.pz; s.h0 = s.heading; s.pitch0 = s.pitch;
@@ -625,7 +628,15 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     // past the 1500 STUCK-prompt threshold sink2 tuned out — prompting on a
     // genuine 1.9 s dead lean is arguably correct, but it is a UX change.
     const wallPress = s.scrapeT > 0 || s.crashT > 0 || s.wallCool > 0;
-    const launchRamp = !offroad && !boostLive && !drifting && !wallPress
+    // Launch ramp is a one-way latch (ramplatch 2026-09-17): armed in
+    // resetRun only, never re-armed mid-run (simRespawn preserves it), and
+    // disarmed permanently once car speed reaches LAUNCH_RAMP_END. While
+    // armed, free-driving grip accel scales by the speed-dependent ramp;
+    // once disarmed, on-road accel is the full ACCEL_ROAD at ANY speed, so
+    // recovering from dirt / a crash / a spin is prompt. Dirt only bites
+    // while off-road via ACCEL_OFFROAD / OFFROAD_DRAG (unchanged).
+    if (s.launchRampArmed && Math.hypot(s.vx, s.vz) >= LAUNCH_RAMP_END) s.launchRampArmed = false;
+    const launchRamp = s.launchRampArmed && !offroad && !boostLive && !drifting && !wallPress
       ? LAUNCH_RAMP_MIN + (1 - LAUNCH_RAMP_MIN) * Math.min(Math.max(fSpeed, 0) / LAUNCH_RAMP_END, 1)
       : 1;
     const accel = (offroad ? ACCEL_OFFROAD : ACCEL_ROAD * launchRamp + boostMakeup + exitBoost + rhythmBoost) * (1 - CRASH_ACCEL_CUT * upset);
@@ -669,6 +680,7 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     if (offroad) fSpeed *= Math.exp(-OFFROAD_DRAG * dt);
     s.vx = hx * fSpeed + hz * lSpeed;
     s.vz = hz * fSpeed - hx * lSpeed;
+    if (s.launchRampArmed && Math.hypot(s.vx, s.vz) >= LAUNCH_RAMP_END) s.launchRampArmed = false;
     // Cycle 7: while the one-shot slingshot is live, cap TOTAL speed (not
     // just forward) at BOOST_SPEED_CAP, so a big lateral slide stacked on the
     // surge cannot punch through the top-speed envelope. One-shot, capped,

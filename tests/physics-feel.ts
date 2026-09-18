@@ -1808,6 +1808,81 @@ const settle = (tr: TrackView, s: SimState, secs: number, inp: StepInput) => {
     ok(Math.abs(rGain - (ACCEL_ROAD + ACCEL_BOOST_MAKEUP + 40)) < 1e-6, 'OT6 rhythm window bit-identical under the ramp', `gain=${rGain.toFixed(4)}`);
   }
 
+  // OT8. Launch-ramp latch (2026-09-17 ramplatch): the ramp is a launch-only,
+  // one-way effect, so dirt / a crash / a spin never re-cripple road accel.
+  // The latch arms in resetRun only, disarms permanently once car speed
+  // reaches LAUNCH_RAMP_END 80, and simRespawn never re-arms it. Measured:
+  // first launch still ramps (punch 21.8 u/s/s, t40 0.92s, t100 1.77s,
+  // t140 2.23s, top 140.0); post-dirt recovery from the 6.0 crawl gains the
+  // full ACCEL_ROAD 85 u/s/s on the first step and reaches 100 in 1.10s,
+  // bit-identical to a fresh disarmed pull from the same crawl speed (an
+  // armed pull from 6.0 would gain only ~18.1). Drift radius/pace untouched
+  // (E2 still 24-34, measured 32.0).
+  {
+    const tr = openPlan(flatTrack());
+    const armedGainAt = (crawl: number): number => {
+      const s = createSimState(); resetRun(s, tr, 0);
+      s.px = tr.x[0]; s.pz = tr.z[0]; s.heading = tr.yaw[0];
+      s.vx = Math.sin(s.heading) * crawl; s.vz = Math.cos(s.heading) * crawl;
+      const b = Math.hypot(s.vx, s.vz);
+      simStep(s, tr, drive, DT);
+      return (Math.hypot(s.vx, s.vz) - b) * 60;
+    };
+    // Armed at reset: the standing start still ramps (not full press).
+    const fresh = createSimState(); resetRun(fresh, tr, 0);
+    ok(fresh.launchRampArmed === true, 'OT8 latch armed at reset');
+    const b0 = Math.hypot(fresh.vx, fresh.vz);
+    simStep(fresh, tr, drive, DT);
+    const punch = (Math.hypot(fresh.vx, fresh.vz) - b0) * 60;
+    const expectPunch = ACCEL_ROAD * (LAUNCH_RAMP_MIN + (1 - LAUNCH_RAMP_MIN) * 10 / LAUNCH_RAMP_END);
+    ok(Math.abs(punch - expectPunch) < 0.5, 'OT8 first launch still ramps', `punch=${punch.toFixed(1)} (ramp=${expectPunch.toFixed(1)}, flat=85)`);
+    // Disarm on the launch straight: speed crosses 80 exactly once.
+    const s = createSimState(); resetRun(s, tr, 0);
+    for (let k = 0; k < 8 / DT && !s.finished; k++) simStep(s, tr, drive, DT);
+    ok(s.launchRampArmed === false, 'OT8 latch disarms once launch speed is reached');
+    // Rescue never re-arms: a post-dirt tow must not re-cripple accel.
+    simRespawn(s);
+    ok(s.launchRampArmed === false, 'OT8 respawn preserves the disarmed latch');
+    // Dirt excursion to the terminal crawl (OT5 equilibrium, unchanged).
+    const d = createSimState(); resetRun(d, tr, 0);
+    for (let k = 0; k < 8 / DT && !d.finished; k++) simStep(d, tr, drive, DT);
+    d.px = 60; d.vx = 0; d.vz = 6;
+    let crawl = 0;
+    for (let k = 0; k < 15 / DT && !d.finished; k++) crawl = simStep(d, tr, drive, DT).spd;
+    ok(crawl >= 3 && crawl <= 8, 'OT8 dirt excursion settles at the crawl', `settle=${crawl.toFixed(1)}`);
+    // Back on the road at the crawl: full press, identical to a fresh
+    // disarmed pull from the same speed, and nothing like the armed ramp.
+    d.px = 0; d.heading = 0; d.vx = 0; d.vz = crawl;
+    const rb = Math.hypot(d.vx, d.vz);
+    simStep(d, tr, drive, DT);
+    const recGain = (Math.hypot(d.vx, d.vz) - rb) * 60;
+    ok(Math.abs(recGain - ACCEL_ROAD) < 1e-6, 'OT8 post-dirt road accel is the full press', `gain=${recGain.toFixed(4)} (flat=${ACCEL_ROAD})`);
+    const c = createSimState(); resetRun(c, tr, 0);
+    for (let k = 0; k < 8 / DT && !c.finished; k++) simStep(c, tr, drive, DT);
+    c.px = 0; c.heading = 0; c.vx = 0; c.vz = crawl;
+    const cb = Math.hypot(c.vx, c.vz);
+    simStep(c, tr, drive, DT);
+    const ctlGain = (Math.hypot(c.vx, c.vz) - cb) * 60;
+    ok(Math.abs(recGain - ctlGain) < 1e-9, 'OT8 recovery matches the disarmed control exactly', `rec=${recGain.toFixed(4)} ctl=${ctlGain.toFixed(4)}`);
+    ok(armedGainAt(crawl) < 25, 'OT8 armed pull at the crawl still ramps (the latch is the difference)', `armed=${armedGainAt(crawl).toFixed(1)} vs disarmed=${ctlGain.toFixed(1)}`);
+    // Crawl back to pace: prompt, and the settled on-road top is still 140,
+    // so ACCEL_OFFROAD / OFFROAD_DRAG leave no residue on the road.
+    let rt100 = -1; const rt0 = d.raceMs / 1000; let rtop = 0;
+    for (let k = 0; k < 14 / DT && !d.finished; k++) {
+      const info = simStep(d, tr, drive, DT);
+      rtop = Math.max(rtop, info.spd);
+      if (rt100 < 0 && info.spd >= 100) rt100 = d.raceMs / 1000 - rt0;
+    }
+    let ct100 = -1; const ct0 = c.raceMs / 1000;
+    for (let k = 0; k < 14 / DT && !c.finished; k++) {
+      const info = simStep(c, tr, drive, DT);
+      if (ct100 < 0 && info.spd >= 100) ct100 = c.raceMs / 1000 - ct0;
+    }
+    ok(Math.abs(rt100 - ct100) < 1e-6, 'OT8 recovery pace matches the control', `rec=${rt100.toFixed(2)}s ctl=${ct100.toFixed(2)}s`);
+    ok(rt100 > 0 && rt100 < 1.3, 'OT8 post-dirt recovery is prompt, not crippled', `crawl->100=${rt100.toFixed(2)}s (was ~1.97s under the speed ramp)`);
+    ok(rtop >= MAX_GRIP_SPEED - 1 && rtop <= MAX_GRIP_SPEED + 1, 'OT8 settled on-road top still at cruise', `top=${rtop.toFixed(1)}`);
+  }
+
   // OT5. Dirt is TERMINAL, spin stays free (2026-09-18 feel3 REQUIREMENT
   // CHANGE: the old contract asserted a big dirt slide never damps into a stop
   // (minSpd > 20) because dirt was a recoverable cruising surface with a ~32

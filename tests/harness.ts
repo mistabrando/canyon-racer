@@ -330,7 +330,9 @@ function traceKey(s: SimState): string {
     }
     // 2026-09-18 sink2 decisive launch softening (ACCEL_ROAD 110 -> 85,
     // LAUNCH_RAMP_MIN 0.55 -> 0.35): measured t100 0.95s -> 1.33s.
-    ok(t100 > 1.1 && t100 < 1.6, 'reaches 100 in 1.1-1.6s', `t=${t100.toFixed(2)}s`);
+    // 2026-09-18 feel3 third slow-launch report (ramp-only MIN 0.15 / END 80,
+    // ACCEL_ROAD stays 85): measured t100 1.33s -> 1.77s.
+    ok(t100 > 1.6 && t100 < 2.0, 'reaches 100 in 1.6-2.0s', `t=${t100.toFixed(2)}s`);
     ok(top >= MAX_GRIP_SPEED - 1 && top <= MAX_GRIP_SPEED + 1, 'grip top speed at cruise', `top=${top.toFixed(1)}`);
   }
 
@@ -396,6 +398,9 @@ function traceKey(s: SimState): string {
     const w = wSum / n, v = vSum / n, r = v / w, slipDeg = slipSum / n * 180 / Math.PI;
     // 2026-09-18 sink2 (mirrors physics-feel E2): sustained-drift pace sits
     // lower under ACCEL_ROAD 85 at unchanged yaw rate, radius 43 -> ~29u.
+    // 2026-09-18 feel3 (slides bypass the deeper 0.15/80 ramp, keeping the full
+    // 85 in the slide): radius reads 28.7 -> 32.0 measured, same band, and the
+    // widening (harder corners) is the right direction after 43 -> 29.
     ok(r > 24 && r < 34, 'drift radius 24-34', `r=${r.toFixed(0)}`);
     ok(slipDeg > 12 && slipDeg < 28, 'controlled drift slip 12-28deg', `slip=${slipDeg.toFixed(1)}`);
   }

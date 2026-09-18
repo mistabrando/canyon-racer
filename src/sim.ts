@@ -26,9 +26,9 @@ export const ACCEL_BOOST_MAKEUP = 55; // raised 30 -> 55 so ACCEL_ROAD + MAKEUP 
 // punches less hard, rising to the full ACCEL_ROAD value by LAUNCH_RAMP_END.
 // Live boost windows (rhythm/exit slingshot) bypass the ramp, so timed-exit
 // surge dynamics stay bit-identical and only the launch ramp changes.
-export const LAUNCH_RAMP_MIN = 0.35; // deepened 0.55 -> 0.35 (2026-09-18 sink2): first-step punch ~39 u/s/s vs ~69, t100 lands ~1.3s
-export const LAUNCH_RAMP_END = 60;
-export const ACCEL_OFFROAD = 16; // dirt: reduced forward traction, still recoverable
+export const LAUNCH_RAMP_MIN = 0.15; // deepened 0.35 -> 0.15 and extended END 60 -> 80 (2026-09-18 feel3, third slow-launch report): ramp-only change, ACCEL_ROAD stays 85; first-step punch ~21.8 u/s/s vs ~39, t100 lands ~1.8s
+export const LAUNCH_RAMP_END = 80;
+export const ACCEL_OFFROAD = 6; // dirt is terminal (2026-09-18 feel3 requirement change): full-throttle equilibrium is ACCEL_OFFROAD/OFFROAD_DRAG = 6 u/s crawl, so a 120 u/s entry decays to <=8 within ~4s and stays there; yaw stays free, recovery stays manual R
 export const MAX_GRIP_SPEED = 140;
 export const MAX_DRIFT_SPEED = 112;
 export const MAX_OFFROAD_SPEED = 44; // dirt plain is slow; momentum still carries
@@ -63,7 +63,7 @@ export const SCRUB_COUNTER_RELIEF = 0.5;
 export const EXIT_BOOST_ACCEL = 32;
 export const EXIT_BOOST_TIME = 0.7;
 export const EXIT_SLIP_MAX = 0.35;
-export const OFFROAD_DRAG = 0.5; // dirt bleeds speed; momentum still carries for a while
+export const OFFROAD_DRAG = 1.0; // dirt drag dominates drive (2026-09-18 feel3 requirement change): no sustainable off-road cruise; see ACCEL_OFFROAD
 export const DRIFT_DRAG = 0.35;
 export const SCRUB_GAIN = 9.0;
 export const SCRUB_MIN_SLIP = 0.61;
@@ -605,7 +605,27 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     const exitBoost = rhythmBoost > 0 ? 0 : (s.exitT > 0 ? EXIT_BOOST_ACCEL : 0);
     const boostMakeup = !offroad && (rhythmBoost > 0 || s.exitT > 0) ? ACCEL_BOOST_MAKEUP : 0;
     const boostLive = rhythmBoost > 0 || s.exitT > 0;
-    const launchRamp = !offroad && !boostLive
+    // The ramp is a free-driving launch device only: grip driving off the line.
+    // A committed slide bypasses it like a live boost window, so sustained
+    // drift pace stays at the full ACCEL_ROAD (feel3: otherwise the deeper
+    // 0.15/80 ramp would starve the sub-80 drift equilibrium and collapse the
+    // drift radius 28.7 -> ~14, tightening corners further — the wrong
+    // direction after 43 -> 29). Rail contact bypasses it too: the wall suite
+    // (13d/E6 pin, lean-settle, escape, R5 recovery) pins the low-speed press
+    // against the rail, and the weaker free-driving press lets the post-impact
+    // slide persist into a wall-to-wall rattle that never settles into the
+    // scraping latch (measured with the ramp applied in contact: pin residual
+    // 3.5 -> 8.7..15.6, stuck latch 1050 -> 0, escape fwd 6.3 -> 1.0..4.0,
+    // R5 pinned recovery never tags 60). Against the rail the engine pushes at
+    // full force while scrape drag (unchanged, drag-dominated: grind pace is
+    // press-insensitive, 13e/R5-grind bands hold under every variant) still
+    // punishes grinding, so contact behavior is preserved and only free-road
+    // launch slows. One known side effect, flagged for the wall owner: a dead
+    // lean now settles faster and the stuck latch reads ~1867 vs ~1050, i.e.
+    // past the 1500 STUCK-prompt threshold sink2 tuned out — prompting on a
+    // genuine 1.9 s dead lean is arguably correct, but it is a UX change.
+    const wallPress = s.scrapeT > 0 || s.crashT > 0 || s.wallCool > 0;
+    const launchRamp = !offroad && !boostLive && !drifting && !wallPress
       ? LAUNCH_RAMP_MIN + (1 - LAUNCH_RAMP_MIN) * Math.min(Math.max(fSpeed, 0) / LAUNCH_RAMP_END, 1)
       : 1;
     const accel = (offroad ? ACCEL_OFFROAD : ACCEL_ROAD * launchRamp + boostMakeup + exitBoost + rhythmBoost) * (1 - CRASH_ACCEL_CUT * upset);

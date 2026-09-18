@@ -17,16 +17,16 @@ export const START_SPEED = 10;
 // is distinctly slower but fluent (~112), and a timed clean exit surges to
 // ~162 before settling back to cruise. Grip-only cannot hold the ordinary
 // drift corners at cruise, so corners demand a real slide.
-export const ACCEL_ROAD = 110; // softened ~21%: launch less violent, cruise (MAX_GRIP_SPEED) unchanged
+export const ACCEL_ROAD = 85; // softened decisively (2026-09-18 sink2: 110 -> 85 with a deeper ramp): the standing start pulls noticeably slower again (t100 ~1.32s vs 0.95s); cruise (MAX_GRIP_SPEED) unchanged
 // Boost-window makeup: one-shot exit/rhythm slingshots add back the
 // pre-softening punch while their window is live, so timed-exit surge
 // dynamics are unchanged and only plain launch/drive accel is gentler.
-export const ACCEL_BOOST_MAKEUP = 30;
+export const ACCEL_BOOST_MAKEUP = 55; // raised 30 -> 55 so ACCEL_ROAD + MAKEUP stays 140: live boost windows keep bit-identical totals (exit 172, rhythm 180)
 // Launch ramp: plain on-road accel is speed-dependent so the standing start
 // punches less hard, rising to the full ACCEL_ROAD value by LAUNCH_RAMP_END.
 // Live boost windows (rhythm/exit slingshot) bypass the ramp, so timed-exit
 // surge dynamics stay bit-identical and only the launch ramp changes.
-export const LAUNCH_RAMP_MIN = 0.55;
+export const LAUNCH_RAMP_MIN = 0.35; // deepened 0.55 -> 0.35 (2026-09-18 sink2): first-step punch ~39 u/s/s vs ~69, t100 lands ~1.3s
 export const LAUNCH_RAMP_END = 60;
 export const ACCEL_OFFROAD = 16; // dirt: reduced forward traction, still recoverable
 export const MAX_GRIP_SPEED = 140;
@@ -253,7 +253,7 @@ export class TouchState {
 // ---------- simulation ----------
 export interface StepInput { steer: number; drift: boolean }
 export interface StepInfo {
-  spd: number; drifting: boolean; sIdx: number; pitch: number;
+  spd: number; drifting: boolean; sIdx: number; gIdx: number; pitch: number;
   launched: boolean; landed: boolean; finished: boolean;
   fSpeed: number; lSpeed: number; slip: number; yawRate: number;
   offroad: boolean; surface: 'road' | 'offroad' | 'air'; landV: number;
@@ -267,7 +267,7 @@ export interface Snap { i: number; x: number; y: number; z: number; h: number; v
 export interface SimState {
   heading: number; px: number; py: number; pz: number;
   vx: number; vz: number; vy: number; grounded: boolean;
-  lastIdx: number; raceMs: number; pitch: number;
+  lastIdx: number; groundIdx: number; raceMs: number; pitch: number;
   finished: boolean; finishCount: number; prevFinD: number;
   px0: number; py0: number; pz0: number; h0: number; pitch0: number; prevRaceMs: number;
   approach: number[];
@@ -283,7 +283,7 @@ export interface SimState {
 export function createSimState(): SimState {
   return {
     heading: 0, px: 0, py: 0, pz: 0, vx: 0, vz: 0, vy: 0, grounded: true,
-    lastIdx: 0, raceMs: 0, pitch: 0,
+    lastIdx: 0, groundIdx: 0, raceMs: 0, pitch: 0,
     finished: false, finishCount: 0, prevFinD: 0,
     px0: 0, py0: 0, pz0: 0, h0: 0, pitch0: 0, prevRaceMs: 0,
     approach: [],
@@ -323,6 +323,26 @@ function fwdLimit(s: SimState, tr: TrackView, dt: number): number {
   return Math.min(2, 1 + Math.ceil((spd * dt) / ds));
 }
 
+// Gate-free ground station: the centreline sample nearest the car in plan, with
+// no forward window and no motion gate. Progress tracking (lastIdx) deliberately
+// freezes while the car is far off-road, so it is the wrong station for ground
+// height: the rendered apron at the car's true position sits at the TRUE
+// neighbour's road height, and the far plane follows the car. Keying physics to
+// the frozen progress sample sank the car whenever the road height changed
+// between the two (measured -21.1u driving parallel on an 8% grade, -1.7..-2.5u
+// on dailies; see docs/agents/offtrack-sink2-2026-09-17.md). Grounding, landing
+// and off-road pitch all use this station; progress, walls, launch, rewards,
+// snapshots and the finish gate stay on the gated lastIdx, untouched.
+export function nearestGroundIdx(tr: TrackView, x: number, z: number): number {
+  let bi = 0, bd = Infinity;
+  for (let i = 0; i < tr.n; i++) {
+    const dx = tr.x[i] - x, dz = tr.z[i] - z;
+    const d = dx * dx + dz * dz;
+    if (d < bd) { bd = d; bi = i; }
+  }
+  return bi;
+}
+
 // Progress-aware tracking: forward-limited window plus a motion gate, so only
 // distance the car actually drove can advance lastIdx. A teleport/cut leaves
 // the car many units from the window edge and freezes progress (and finish)
@@ -345,7 +365,7 @@ function distXZ(tr: TrackView, a: number, b: number): number {
 
 // Full run reset with an exact start sample at t=0.
 export function resetRun(s: SimState, tr: TrackView, i0: number) {
-  s.lastIdx = i0;
+  s.lastIdx = i0; s.groundIdx = i0;
   s.px = tr.x[i0]; s.pz = tr.z[i0]; s.py = tr.y[i0] + 0.2;
   s.heading = tr.yaw[i0];
   s.vx = tr.tx[i0] * START_SPEED; s.vz = tr.tz[i0] * START_SPEED; s.vy = 0; s.grounded = true;
@@ -391,7 +411,7 @@ export function simRespawn(s: SimState) {
     s.snaps.length = pick + 1;
     s.snap = anchor;
   }
-  s.lastIdx = anchor.i;
+  s.lastIdx = anchor.i; s.groundIdx = anchor.i;
   s.px = anchor.x; s.py = anchor.y; s.pz = anchor.z;
   s.heading = anchor.h; s.vx = anchor.vx; s.vz = anchor.vz; s.vy = 0; s.grounded = true;
   s.driftAmt = 0; s.wasOffroad = false;
@@ -427,7 +447,7 @@ function clearDirtReward(s: SimState): void {
 
 export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number): StepInfo {
   const noop: StepInfo = {
-    spd: Math.hypot(s.vx, s.vz), drifting: false, sIdx: s.lastIdx,
+    spd: Math.hypot(s.vx, s.vz), drifting: false, sIdx: s.lastIdx, gIdx: s.groundIdx,
     pitch: s.pitch, launched: false, landed: false, finished: true,
     fSpeed: 0, lSpeed: 0, slip: 0, yawRate: 0,
     offroad: false, surface: s.grounded ? 'road' : 'air', landV: 0,
@@ -663,8 +683,10 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   // plain (see ./surface.ts). The car always has a surface under it — no void,
   // no bottomless fall, no invisible backstop wall. Only a road crest launches
   // it into real airtime, and it lands back on whatever surface is below.
-  const latN = (s.px - tr.x[i]) * tr.nx[i] + (s.pz - tr.z[i]) * tr.nz[i];
-  const groundY = groundSurfaceY(tr.y[i], latN, tr.halfW) + 0.2;
+  const g = nearestGroundIdx(tr, s.px, s.pz);
+  s.groundIdx = g;
+  const latN = (s.px - tr.x[g]) * tr.nx[g] + (s.pz - tr.z[g]) * tr.nz[g];
+  const groundY = groundSurfaceY(tr.y[g], latN, tr.halfW) + 0.2;
   // A step that ends off the asphalt also drops any drift reward (covers an
   // edge crossing the start-of-step projection missed).
   if (Math.abs(latN) > tr.halfW) clearDirtReward(s);
@@ -672,15 +694,18 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     s.py = groundY;
     if (Math.abs(latN) > tr.halfW) {
       // Off-road pitch follows the surface under the car, not the road grade
-      // at the nearest centreline sample: sample groundSurfaceY ahead/behind
-      // along the heading so the verge banks the nose down its slope and the
-      // flat plain past it reads level. On-road pitch is untouched above.
+      // at the progress sample: sample groundSurfaceY ahead/behind along the
+      // heading around the GROUND station (which the renderer built the ribbon
+      // from) so the verge banks the nose down its slope and the flat plain
+      // past it reads level. On-road pitch is untouched above.
+      const i1g = Math.min(g + 1, tr.n - 1), i0g = Math.max(g - 1, 0);
+      const gradeG = (tr.y[i1g] - tr.y[i0g]) / distXZ(tr, i0g, i1g);
       const hxP = Math.sin(s.heading), hzP = Math.cos(s.heading);
       const PD = 1.5;
-      const daF = (hxP * tr.tx[i] + hzP * tr.tz[i]) * PD;
-      const dlF = (hxP * tr.nx[i] + hzP * tr.nz[i]) * PD;
-      const gF = groundSurfaceY(tr.y[i] + gradeHere * daF, latN + dlF, tr.halfW);
-      const gR = groundSurfaceY(tr.y[i] - gradeHere * daF, latN - dlF, tr.halfW);
+      const daF = (hxP * tr.tx[g] + hzP * tr.tz[g]) * PD;
+      const dlF = (hxP * tr.nx[g] + hzP * tr.nz[g]) * PD;
+      const gF = groundSurfaceY(tr.y[g] + gradeG * daF, latN + dlF, tr.halfW);
+      const gR = groundSurfaceY(tr.y[g] - gradeG * daF, latN - dlF, tr.halfW);
       s.pitch = Math.atan(clamp((gF - gR) / (2 * PD), -0.5, 0.5));
     } else {
       s.pitch = Math.atan(clamp(gradeHere, -0.5, 0.5));
@@ -928,7 +953,7 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   const fSpeed = s.vx * ehx + s.vz * ehz;
   const lSpeed = s.vx * ehz - s.vz * ehx;
   return {
-    spd, drifting, sIdx, pitch: s.pitch, launched, landed, finished,
+    spd, drifting, sIdx, gIdx: s.groundIdx, pitch: s.pitch, launched, landed, finished,
     fSpeed, lSpeed,
     slip: Math.atan2(lSpeed, Math.abs(fSpeed) + 1e-6),
     yawRate: wrapPi(s.heading - s.h0) / dt,

@@ -1019,7 +1019,7 @@ function surfaceYAt(idx: number, x: number, z: number): number {
 function syncCarTransform() {
   car.position.set(sim.px, sim.py, sim.pz);
   car.rotation.set(sim.pitch, sim.heading, 0);
-  const gy = surfaceYAt(sim.lastIdx, sim.px, sim.pz) + 0.2;
+  const gy = surfaceYAt(sim.groundIdx, sim.px, sim.pz) + 0.2;
   blob.position.set(sim.px, gy + 0.06, sim.pz);
   blob.scale.setScalar(1 + clamp(sim.py - gy, 0, 12) * 0.04);
 }
@@ -1160,7 +1160,7 @@ function step(dt: number): StepInfo {
   }
   const every = trailSpawnEvery(trailSm);
   if (every > 0 && trailTick % every === 0) {
-    const groundY = surfaceYAt(sim.lastIdx, sim.px, sim.pz) + 0.2;
+    const groundY = surfaceYAt(sim.groundIdx, sim.px, sim.pz) + 0.2;
     const fx = Math.sin(sim.heading), fz = Math.cos(sim.heading);
     const rx = -fz, rz = fx;
     const w = trailWidth(trailSm), len = trailLength(trailSm), shade = trailShade(trailSm);
@@ -1245,8 +1245,12 @@ function recenterGround() {
   groundPlain.position.z = Math.round(camera.position.z / GROUND_SNAP) * GROUND_SNAP;
   // The road height varies along the course, so the flat far field rides at
   // the shared apron level under the car: the seam where the apron ribbon
-  // ends always meets the plane within road-grade of the car.
-  const li = Math.min(Math.max(sim.lastIdx | 0, 0), track.n - 1);
+  // ends always meets the plane within road-grade of the car. This follows
+  // the gate-free ground station (the sample the physics grounds the car on),
+  // NOT the frozen progress index: following lastIdx sank the car below the
+  // rendered dirt whenever the road height changed after the progress gate
+  // froze (see docs/agents/offtrack-sink2-2026-09-17.md).
+  const li = Math.min(Math.max(sim.groundIdx | 0, 0), track.n - 1);
   groundPlain.position.y = offroadLevel(track.y[li]) - 0.05;
 }
 function renderScene() {
@@ -1437,7 +1441,7 @@ function frame(now: number) {
       );
       const tail = car.userData.tail as THREE.MeshBasicMaterial | undefined;
       if (tail) tail.color.setHex(motion.driftMix > 0.4 || input.drift ? 0xff5a2a : 0xff2a2a);
-      const groundY = surfaceYAt(info.sIdx, rp.x, rp.z) + 0.2;
+      const groundY = surfaceYAt(info.gIdx ?? info.sIdx, rp.x, rp.z) + 0.2;
       blob.position.set(rp.x, groundY + 0.06, rp.z);
       blob.scale.setScalar(1 + clamp(rp.y - groundY, 0, 12) * 0.04);
       // deterministic chase camera (./render-motion.ts): lagged velocity-led

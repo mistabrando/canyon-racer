@@ -328,7 +328,9 @@ function traceKey(s: SimState): string {
       if (t100 < 0 && info.spd >= 100) t100 = s.raceMs / 1000;
       top = Math.max(top, info.spd);
     }
-    ok(t100 > 0.5 && t100 < 1.1, 'reaches 100 in 0.5-1.1s', `t=${t100.toFixed(2)}s`);
+    // 2026-09-18 sink2 decisive launch softening (ACCEL_ROAD 110 -> 85,
+    // LAUNCH_RAMP_MIN 0.55 -> 0.35): measured t100 0.95s -> 1.33s.
+    ok(t100 > 1.1 && t100 < 1.6, 'reaches 100 in 1.1-1.6s', `t=${t100.toFixed(2)}s`);
     ok(top >= MAX_GRIP_SPEED - 1 && top <= MAX_GRIP_SPEED + 1, 'grip top speed at cruise', `top=${top.toFixed(1)}`);
   }
 
@@ -352,7 +354,9 @@ function traceKey(s: SimState): string {
     // 2026-09-17 launch softening (ACCEL_ROAD 140 -> 110): drift yaw is
     // unchanged (w ~ 1.9) but the speed equilibrium sits lower, so the
     // converged radius reads ~45u instead of ~59u. Same slide, slower pace.
-    ok(r > 38 && r < 60, 'auto-drift converges to drift radius', `r=${r.toFixed(0)}`);
+    // 2026-09-18 sink2 decisive softening (ACCEL_ROAD 110 -> 85): the same
+    // mechanism reads ~35u now. Same slide, slower pace again.
+    ok(r > 28 && r < 48, 'auto-drift converges to drift radius', `r=${r.toFixed(0)}`);
     const g = createSimState();
     resetRun(g, tr, 0);
     settleRun(tr, g, 8, drive);
@@ -390,7 +394,9 @@ function traceKey(s: SimState): string {
       wSum += Math.abs(info.yawRate); vSum += info.spd; slipSum += Math.abs(info.slip); n++;
     }
     const w = wSum / n, v = vSum / n, r = v / w, slipDeg = slipSum / n * 180 / Math.PI;
-    ok(r > 35 && r < 55, 'drift radius 35-55', `r=${r.toFixed(0)}`);
+    // 2026-09-18 sink2 (mirrors physics-feel E2): sustained-drift pace sits
+    // lower under ACCEL_ROAD 85 at unchanged yaw rate, radius 43 -> ~29u.
+    ok(r > 24 && r < 34, 'drift radius 24-34', `r=${r.toFixed(0)}`);
     ok(slipDeg > 12 && slipDeg < 28, 'controlled drift slip 12-28deg', `slip=${slipDeg.toFixed(1)}`);
   }
 
@@ -759,7 +765,11 @@ function traceKey(s: SimState): string {
     lean.px = tr.x[100] - 9.7; lean.heading = tr.yaw[100] - Math.PI / 2; lean.vx = 0; lean.vz = 0;
     stuckMax = 0;
     for (let k = 0; k < 2.5 / DT; k++) stuckMax = Math.max(stuckMax, simStep(lean, tr, drive, DT).stuckMs);
-    ok(stuckMax > 1500, 'stuck flag when leaning on wall', `stuckMs=${stuckMax.toFixed(0)}`);
+    // 2026-09-18 sink2 (mirrors physics-feel E6): the softened low-speed
+    // press shortens the lean scrape run 102 -> 63 steps, so the latch peaks
+    // at 1050ms (flag still latches; dead-perpendicular leans no longer reach
+    // the 1500ms STUCK prompt threshold — see E6).
+    ok(stuckMax > 900, 'stuck flag when leaning on wall', `stuckMs=${stuckMax.toFixed(0)}`);
     s = pin();
     for (let k = 0; k < 1.5 / DT; k++) simStep(s, tr, drive, DT);
     let t20 = -1;

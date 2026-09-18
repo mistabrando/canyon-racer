@@ -72,7 +72,7 @@ export function retryDisplayReset(): RetryDisplayReset {
 // Fresh object every call (main.ts reassigns it; callers must not share a ref).
 export function neutralRunInfo(): StepInfo {
   return {
-    spd: 0, drifting: false, sIdx: 0, pitch: 0,
+    spd: 0, drifting: false, sIdx: 0, gIdx: 0, pitch: 0,
     launched: false, landed: false, finished: false,
     fSpeed: 0, lSpeed: 0, slip: 0, yawRate: 0,
     offroad: false, surface: 'road', landV: 0,

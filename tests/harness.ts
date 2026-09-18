@@ -349,7 +349,10 @@ function traceKey(s: SimState): string {
     }
     const w = wSum / n, v = vSum / n, r = v / w;
     ok(tDrift >= 0 && tDrift <= 1.2, 'full lock at top speed breaks into drift', `t=${tDrift.toFixed(2)}s`);
-    ok(r > 48 && r < 68, 'auto-drift converges to drift radius', `r=${r.toFixed(0)}`);
+    // 2026-09-17 launch softening (ACCEL_ROAD 140 -> 110): drift yaw is
+    // unchanged (w ~ 1.9) but the speed equilibrium sits lower, so the
+    // converged radius reads ~45u instead of ~59u. Same slide, slower pace.
+    ok(r > 38 && r < 60, 'auto-drift converges to drift radius', `r=${r.toFixed(0)}`);
     const g = createSimState();
     resetRun(g, tr, 0);
     settleRun(tr, g, 8, drive);
@@ -361,7 +364,9 @@ function traceKey(s: SimState): string {
     }
     const gw = gwSum / gn, gv = gvSum / gn;
     ok(held, 'moderate lock at top speed holds grip');
-    ok(gw > 0.4 && gw < 0.9 && gv > 85, 'moderate grip line is fast and wide', `w=${gw.toFixed(2)} v=${gv.toFixed(0)}`);
+    // 2026-09-17 launch softening: the moderate-lock scrub equilibrium sits
+    // ~2u/s lower under ACCEL_ROAD 110 (83 vs 85); the line width is untouched.
+    ok(gw > 0.4 && gw < 0.9 && gv > 80, 'moderate grip line is fast and wide', `w=${gw.toFixed(2)} v=${gv.toFixed(0)}`);
   }
 
   // 11c. Controlled drift: radius 35-50, slip 12-28 degrees once settled.

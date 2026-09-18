@@ -101,7 +101,12 @@ export const BUDGET = {
 // no textures, no new constructor dependencies.
 export const SIGN = {
   BOARD_W: 2.4, BOARD_H: 1.3,
-  ARROW_W: 1.15, ARROW_H: 1.0, ARROW_NOTCH: 0.42,
+  // Symbol sized to fill the board face: at chase-cam distance and ~140 u/s
+  // the 1.15u chevron subtended too few pixels to read. 1.5u keeps 0.45u side
+  // margins, the double-chevron span (1.5 + 0.5) still fits the 2.4u board,
+  // and the notch preserves the original chevron angle. Zero budget impact
+  // (same 2 tris per symbol, same one instanced draw call).
+  ARROW_W: 1.5, ARROW_H: 1.05, ARROW_NOTCH: 0.55,
   TIGHT_MED_R: 62,
   SEVERE_MED_R: 130,
   DOUBLE_GAP: 0.5,

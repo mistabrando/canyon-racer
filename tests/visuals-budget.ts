@@ -10,7 +10,7 @@ import {
   planGuardrails, planSignArrows, planSpeedTicks, resolveOptions, withinBudget,
 } from '../src/visuals.js';
 import type {
-  CornerEventLike, ThreeKit, TrackData, Vec3Like,
+  Chevron, CornerEventLike, ThreeKit, TrackData, Vec3Like,
 } from '../src/visuals.js';
 import { acceptDailyTrack, arcLengths, TRACK_HALF_W } from '../src/trackgen.js';
 import { trackFromPoints } from '../src/sim.js';
@@ -436,6 +436,20 @@ function arcTrack(dir: 'L' | 'R', steps = 200, R = 100, ds = 2): TrackData {
   handle.dispose();
 }
 
+
+// 8e. Chase-cam legibility pins (no GL needed): the arrow symbol fills most
+// of the board face so it reads at racing speed, the double-chevron span
+// stays on the board, and the L/R variants are true mirrors (opposite signs,
+// not identical geometry).
+{
+  ok(SIGN.ARROW_W / SIGN.BOARD_W >= 0.5, 'arrow fills board width for distance legibility', `${SIGN.ARROW_W}/${SIGN.BOARD_W}`);
+  ok(SIGN.ARROW_H <= SIGN.BOARD_H && SIGN.ARROW_H >= SIGN.BOARD_H * 0.6, 'arrow fills board height, stays on face', `${SIGN.ARROW_H}/${SIGN.BOARD_H}`);
+  ok(SIGN.ARROW_W + SIGN.DOUBLE_GAP <= SIGN.BOARD_W, 'double-chevron span stays on the board', `${SIGN.ARROW_W + SIGN.DOUBLE_GAP}/${SIGN.BOARD_W}`);
+  ok(SIGN.ARROW_NOTCH > 0 && SIGN.ARROW_NOTCH < SIGN.ARROW_W / 2, 'notch is a true concave chevron', `notch=${SIGN.ARROW_NOTCH}`);
+  const left: Chevron = { s: 0, side: 1, dir: 'L', severe: false, tight: false };
+  const right: Chevron = { s: 0, side: -1, dir: 'R', severe: false, tight: false };
+  ok(arrowPointSign(left) === -arrowPointSign(right), 'L/R arrow variants are mirrored, not identical');
+}
 
 // ---------- Cycle 2: environment + sightlines ----------
 

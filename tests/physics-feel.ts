@@ -14,7 +14,7 @@ import {
   DRIFT_FATIGUE_GRACE, DRIFT_FATIGUE_GAIN, DRIFT_FATIGUE_MAX,
   REAR_LOOSEN_GAIN, REAR_LOOSEN_MAX, COUNTER_GRIP_BOOST,
   SCRUB_COUNTER_RELIEF, EXIT_BOOST_ACCEL, EXIT_BOOST_TIME, EXIT_SLIP_MAX,
-WALL_MARGIN, CRASH_UPSET_TIME,
+WALL_MARGIN, CRASH_UPSET_TIME, WALL_CLAMP_REACH, ACCEL_ROAD, ACCEL_BOOST_MAKEUP,
   SNAP_RAIL_CLEAR, SNAP_MAX_HEAD_ERR, SNAP_HISTORY, SNAP_MIN_SPD,
   SNAP_RESUME_AHEAD } from '../src/sim.js';
 import { BOOST_SPEED_CAP } from '../src/drift-control.js';
@@ -1580,6 +1580,136 @@ const settle = (tr: TrackView, s: SimState, secs: number, inp: StepInput) => {
     let fin = false;
     for (let k = 0; k < 120; k++) { if (simStep(f, ft, drive, DT).finished) { fin = true; break; } }
     ok(!fin && !f.finished, 'SD4 dirt beside the finish cannot cross off-road');
+  }
+}
+
+// OT. Off-track freedom + softened launch (2026-09-17). Root causes fixed in
+// sim.ts: grounded pitch sampled the road grade even on the flat plain, and
+// the rail clamp yanked far-out cars back to LIM in one step (a 50u+ snap on
+// guarded spans that read as a reset). Launch accel softened 140 -> 110 with
+// boost-window makeup so exit surge dynamics are unchanged.
+{
+  const openPlan = (tr: TrackView): TrackView => {
+    tr.barrier = { spans: [], length: tr.cum[tr.cum.length - 1] };
+    return tr;
+  };
+  const railPlan = (tr: TrackView): TrackView => {
+    const L = tr.cum[tr.cum.length - 1];
+    tr.barrier = { spans: [{ aS: 0, bS: L, side: 1 }, { aS: 0, bS: L, side: -1 }], length: L };
+    return tr;
+  };
+  const slopeTrack = (): TrackView => {
+    const pts: { x: number; y: number; z: number }[] = [];
+    for (let z = 0; z <= 2000; z += 2) pts.push({ x: 0, y: 6 + z * 0.08, z });
+    return trackFromPoints(pts, 8);
+  };
+  const parkOut = (tr: TrackView, lat: number, spd: number): SimState => {
+    const s = createSimState(); resetRun(s, tr, 100);
+    s.px = tr.x[100] + tr.nx[100] * lat; s.pz = tr.z[100] + tr.nz[100] * lat;
+    s.heading = tr.yaw[100]; s.vx = tr.tx[100] * spd; s.vz = tr.tz[100] * spd;
+    s.vy = 0; s.grounded = true;
+    return s;
+  };
+  const latOfS = (s: SimState, tr: TrackView): number => {
+    const j = s.lastIdx;
+    return (s.px - tr.x[j]) * tr.nx[j] + (s.pz - tr.z[j]) * tr.nz[j];
+  };
+
+  // OT1. Off-road pitch follows the surface, not the distant road grade.
+  {
+    const tr = openPlan(slopeTrack());
+    const s = parkOut(tr, 60, 40);
+    const info = simStep(s, tr, drive, DT);
+    ok(Math.abs(info.pitch) < 0.02, 'OT1 far-offroad pitch reads level on the plain', `pitch=${info.pitch.toFixed(4)}`);
+    const g = createSimState(); resetRun(g, tr, 100);
+    for (let k = 0; k < 30; k++) simStep(g, tr, drive, DT);
+    const j = g.lastIdx;
+    const grade = (tr.y[Math.min(j + 1, tr.n - 1)] - tr.y[Math.max(j - 1, 0)])
+      / Math.hypot(tr.x[Math.min(j + 1, tr.n - 1)] - tr.x[Math.max(j - 1, 0)], tr.z[Math.min(j + 1, tr.n - 1)] - tr.z[Math.max(j - 1, 0)]);
+    ok(Math.abs(g.pitch - Math.atan(grade)) < 1e-9, 'OT1 on-road pitch still tracks road grade');
+    const v = parkOut(tr, tr.halfW + 9, 40);
+    const vi = simStep(v, tr, drive, DT);
+    ok(vi.pitch > 0 && vi.pitch < Math.atan(0.08), 'OT1 verge pitch banks between plain and road', `pitch=${vi.pitch.toFixed(4)}`);
+  }
+
+  // OT2. No lateral snap far off the road on railed plans; legacy still clamps.
+  {
+    const tr = railPlan(flatTrack());
+    const LIM = wallLimit(tr.halfW);
+    const s = parkOut(tr, 60, 40);
+    let minLat = 99, hit = false, scrape = false;
+    for (let k = 0; k < 60; k++) {
+      const i = simStep(s, tr, drive, DT);
+      minLat = Math.min(minLat, Math.abs(latOfS(s, tr)));
+      if (i.wallHit === true) hit = true;
+      if (i.scraping) scrape = true;
+    }
+    ok(minLat > LIM + WALL_CLAMP_REACH, 'OT2 guarded span never yanks the far-out car', `minLat=${minLat.toFixed(1)} LIM=${LIM.toFixed(2)}`);
+    ok(!hit && !scrape, 'OT2 no wall events on the open plain');
+    const lt = flatTrack();
+    const d = parkOut(lt, 60, 40);
+    simStep(d, lt, drive, DT);
+    ok(Math.abs(latOfS(d, lt)) <= wallLimit(lt.halfW) + 0.05, 'OT2 legacy deep cutter still clamps to boundary');
+  }
+
+  // OT3. The car can always drive back; frozen progress never strands position.
+  {
+    const tr = openPlan(flatTrack());
+    const s = parkOut(tr, 60, 40);
+    let tBack = -1, minSpd = 99;
+    for (let k = 0; k < 20 / DT && !s.finished; k++) {
+      const j = s.lastIdx;
+      const want = Math.atan2(tr.x[j] - s.px, tr.z[j] - s.pz);
+      let dh = want - s.heading;
+      while (dh > Math.PI) dh -= 2 * Math.PI;
+      while (dh < -Math.PI) dh += 2 * Math.PI;
+      const info = simStep(s, tr, { steer: clamp(-dh * 2, -1, 1), drift: false }, DT);
+      minSpd = Math.min(minSpd, info.spd);
+      if (Math.abs(latOfS(s, tr)) <= tr.halfW) { tBack = s.raceMs / 1000; break; }
+    }
+    ok(tBack > 0 && tBack < 8, 'OT3 steered car rejoins the road', `t=${tBack.toFixed(2)}s`);
+    ok(minSpd > 10, 'OT3 speed never collapses on the way back', `min=${minSpd.toFixed(1)}`);
+    const ft = openPlan(flatTrack());
+    const f = parkOut(ft, 300, 40);
+    const fx0 = f.px, fz0 = f.pz, fli = f.lastIdx;
+    for (let k = 0; k < 2 / DT; k++) simStep(f, ft, drive, DT);
+    ok(f.lastIdx === fli, 'OT3 progress stays frozen while far out');
+    ok(Math.hypot(f.px - fx0, f.pz - fz0) > 10, 'OT3 position still integrates while frozen');
+  }
+
+  // OT4. Softened launch band with the exit punch preserved by makeup.
+  {
+    ok(ACCEL_ROAD >= 105 && ACCEL_ROAD <= 118, 'OT4 launch accel in the softened band', `ACCEL_ROAD=${ACCEL_ROAD}`);
+    ok(ACCEL_ROAD + ACCEL_BOOST_MAKEUP === 140, 'OT4 boost windows keep the old punch', `makeup=${ACCEL_BOOST_MAKEUP}`);
+    const tr = wideTrack(8);
+    const s = createSimState(); resetRun(s, tr, 0);
+    let t100 = -1, t140 = -1, top = 0;
+    for (let k = 0; k < 20 / DT && !s.finished; k++) {
+      const info = simStep(s, tr, drive, DT);
+      const t = s.raceMs / 1000;
+      if (t100 < 0 && info.spd >= 100) t100 = t;
+      if (t140 < 0 && info.spd >= 140) t140 = t;
+      top = Math.max(top, info.spd);
+    }
+    ok(t100 > 0.70 && t100 < 1.00, 'OT4 time-to-100 softened', `t=${t100.toFixed(2)}s (was 0.65)`);
+    ok(t140 > 1.00 && t140 < 1.50, 'OT4 time-to-140 softened but prompt', `t=${t140.toFixed(2)}s (was 0.93)`);
+    ok(top >= MAX_GRIP_SPEED - 1 && top <= MAX_GRIP_SPEED + 1, 'OT4 cruise still reaches 140', `top=${top.toFixed(1)}`);
+  }
+
+  // OT5. Spin stays free off-road: a big slide is never damped into a stop,
+  // and heading never auto-damps — the user owns the spin.
+  {
+    const tr = openPlan(flatTrack());
+    const s = parkOut(tr, 30, 0);
+    const h = s.heading + Math.PI / 4, sp = 60;
+    s.vx = Math.sin(h) * sp; s.vz = Math.cos(h) * sp;
+    const h0 = s.heading;
+    let minSpd = 99;
+    for (let k = 0; k < 4 / DT && !s.finished; k++) {
+      minSpd = Math.min(minSpd, simStep(s, tr, drive, DT).spd);
+    }
+    ok(minSpd > 20, 'OT5 big dirt slide never damps into a stop', `min=${minSpd.toFixed(1)}`);
+    ok(Math.abs(s.heading - h0) < 1e-9, 'OT5 heading never auto-damps; the user owns the spin');
   }
 }
 

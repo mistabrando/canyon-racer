@@ -527,11 +527,20 @@ function botRun(day: string): { t: number; finished: boolean; walls: number; res
         // makes a sub-160u corner holdable at this entry speed.
         steer = follow(s, tr, off) * 0.7;
         drift = true;
-        if (variant === 'correct' && !corrDone && sM > e.startS + 60) { blip = 3; corrDone = true; }
+        // Recalibrated 2026-09-17 for the 110 road acceleration (was
+        // startS+60, 3+3 frames @ 0.4): the softer launch develops the slide
+        // more slowly, so the same-impulse jab lands on a young slide and
+        // kills it (measured 09-07: slide dies 40u early, wall, q 0.00; and
+        // 07-28 exits +4.45 off the sustain pace). Moved out to startS+80
+        // where the slide is developed enough to absorb it (blip slide-age
+        // ~41 vs ~30 before), and shortened to a symmetric 2+2 @ 0.3, which
+        // measures neutral on all three corners (exit deltas 0.00/0.21/1.98
+        // vs the <3 band; quality deltas <= 0.01 vs the 0.05 band).
+        if (variant === 'correct' && !corrDone && sM > e.startS + 80) { blip = 2; corrDone = true; }
         // Out-and-back: returning to the same line is what makes the correction
         // cost nothing (a one-sided blip shifts the endS+40 exit speed).
-        if (blip > 0) { steer = -dirS * 0.4; blip--; if (blip <= 0) back = 3; }
-        else if (back > 0) { steer = dirS * 0.4; back--; }
+        if (blip > 0) { steer = -dirS * 0.3; blip--; if (blip <= 0) back = 2; }
+        else if (back > 0) { steer = dirS * 0.3; back--; }
         // Late exit must land far enough past the optimal window to earn less.
         if (sM >= (variant === 'late' ? e.endS + 30 : e.endS - 5)) { phase = 3; exitHold = 12; }
       } else if (phase === 3) { steer = -dirS * 0.4; drift = false; if (--exitHold <= 0) phase = 4; }

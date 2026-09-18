@@ -17,7 +17,11 @@ export const START_SPEED = 10;
 // is distinctly slower but fluent (~112), and a timed clean exit surges to
 // ~162 before settling back to cruise. Grip-only cannot hold the ordinary
 // drift corners at cruise, so corners demand a real slide.
-export const ACCEL_ROAD = 140;
+export const ACCEL_ROAD = 110; // softened ~21%: launch less violent, cruise (MAX_GRIP_SPEED) unchanged
+// Boost-window makeup: one-shot exit/rhythm slingshots add back the
+// pre-softening punch while their window is live, so timed-exit surge
+// dynamics are unchanged and only plain launch/drive accel is gentler.
+export const ACCEL_BOOST_MAKEUP = 30;
 export const ACCEL_OFFROAD = 16; // dirt: reduced forward traction, still recoverable
 export const MAX_GRIP_SPEED = 140;
 export const MAX_DRIFT_SPEED = 112;
@@ -81,6 +85,14 @@ export const WALL_MARGIN = 0.3;
 export function wallLimit(halfW: number): number {
   return halfW + RAIL_OFFSET - RAIL_HALF_DEPTH - CAR_RADIUS - WALL_MARGIN;
 }
+// Reach gate for the rail clamp on open-edge (barrier-plan) tracks: a car
+// already far outside the rail line drove out through an opening (or landed
+// there), so yanking it back to LIM in one step is a multi-unit teleport that
+// reads as a reset. Only correct penetrations within one step of travel at
+// boost pace (~2.7u) plus curve-frame slack may clamp; anything deeper stays
+// free on the plain and drives back through an opening. Legacy null-barrier
+// tracks (closed-circuit tests) keep collide-everywhere exactly.
+export const WALL_CLAMP_REACH = 4.0;
 export const WALL_GLANCE_VN = 6;
 export const WALL_GLANCE_GAIN = 0.02;
 export const WALL_GLANCE_MAX = 0.15;
@@ -565,7 +577,8 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
     // of the instant loss, so wall-leaning lines lose more than clean ones.
     const upset = s.crashT > 0 ? Math.min(Math.abs(s.crashAmp) / CRASH_WOBBLE, 1) : 0;
     const exitBoost = rhythmBoost > 0 ? 0 : (s.exitT > 0 ? EXIT_BOOST_ACCEL : 0);
-    const accel = (offroad ? ACCEL_OFFROAD : ACCEL_ROAD + exitBoost + rhythmBoost) * (1 - CRASH_ACCEL_CUT * upset);
+    const boostMakeup = !offroad && (rhythmBoost > 0 || s.exitT > 0) ? ACCEL_BOOST_MAKEUP : 0;
+    const accel = (offroad ? ACCEL_OFFROAD : ACCEL_ROAD + boostMakeup + exitBoost + rhythmBoost) * (1 - CRASH_ACCEL_CUT * upset);
     if (fSpeed < maxSp) fSpeed = Math.min(maxSp, fSpeed + accel * dt);
     // Cycle 7: boost overshoot bleeds back toward grip top once every boost
     // has expired, so the slingshot is a surge (not a permanent +4 cruise).
@@ -647,7 +660,21 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   if (Math.abs(latN) > tr.halfW) clearDirtReward(s);
   if (s.grounded) {
     s.py = groundY;
-    s.pitch = Math.atan(clamp(gradeHere, -0.5, 0.5));
+    if (Math.abs(latN) > tr.halfW) {
+      // Off-road pitch follows the surface under the car, not the road grade
+      // at the nearest centreline sample: sample groundSurfaceY ahead/behind
+      // along the heading so the verge banks the nose down its slope and the
+      // flat plain past it reads level. On-road pitch is untouched above.
+      const hxP = Math.sin(s.heading), hzP = Math.cos(s.heading);
+      const PD = 1.5;
+      const daF = (hxP * tr.tx[i] + hzP * tr.tz[i]) * PD;
+      const dlF = (hxP * tr.nx[i] + hzP * tr.nz[i]) * PD;
+      const gF = groundSurfaceY(tr.y[i] + gradeHere * daF, latN + dlF, tr.halfW);
+      const gR = groundSurfaceY(tr.y[i] - gradeHere * daF, latN - dlF, tr.halfW);
+      s.pitch = Math.atan(clamp((gF - gR) / (2 * PD), -0.5, 0.5));
+    } else {
+      s.pitch = Math.atan(clamp(gradeHere, -0.5, 0.5));
+    }
   } else {
     s.py += s.vy * dt;
     s.airSteps++;
@@ -710,7 +737,11 @@ export function simStep(s: SimState, tr: TrackView, inp: StepInput, dt: number):
   const rx = s.px - tr.x[j], rz = s.pz - tr.z[j];
   const sCar = tr.cum ? clamp(tr.cum[j] + rx * tr.tx[j] + rz * tr.tz[j], 0, tr.barrier ? tr.barrier.length : tr.cum[tr.cum.length - 1]) : 0;
   const guarded = tr.barrier && tr.cum ? barrierAt(tr.barrier, sCar, bSide) : true;
-  if (Math.abs(lat2) > LIM && guarded) {
+  // Far-outside skip (plan tracks only): beyond WALL_CLAMP_REACH past LIM the
+  // car is fenced OUT, not rubbing the rail — leave position and velocity
+  // alone so momentum and steering stay free on the plain.
+  const farOutside = tr.barrier != null && Math.abs(lat2) - LIM > WALL_CLAMP_REACH;
+  if (Math.abs(lat2) > LIM && guarded && !farOutside) {
     const push = Math.abs(lat2) - LIM;
     const sg = Math.sign(lat2);
     s.px -= tr.nx[j] * sg * push; s.pz -= tr.nz[j] * sg * push;

@@ -758,6 +758,92 @@ const pauseOverlay = document.getElementById('pauseoverlay')!;
 const resumeBtn = document.getElementById('resumebtn') as HTMLButtonElement;
 const pauseMenuBtn = document.getElementById('pausemenubtn') as HTMLButtonElement;
 const pausePlayBtn = document.getElementById('pauseplaybtn') as HTMLButtonElement;
+// Single writer for #msg: the countdown is styled large via the .count hook
+// (and a touch larger for GO! via .go); every other line clears the hook so
+// nothing else inherits the huge size.
+function setMsg(text: string, count = false, go = false) {
+  msgEl.textContent = text;
+  msgEl.classList.toggle('count', count);
+  msgEl.classList.toggle('go', go);
+}
+type MedalKind = 'gold' | 'silver' | 'bronze';
+function medalLabelSpan(medal: MedalKind): HTMLSpanElement {
+  const s = document.createElement('span');
+  s.className = medal === 'gold' ? 'mgold' : medal === 'silver' ? 'msilver' : 'mbronze';
+  s.textContent = medal.toUpperCase();
+  return s;
+}
+// One atomic "LABEL time" pair: white-space:nowrap keeps a medal on one line.
+// Built with DOM nodes (textContent only), never innerHTML.
+function targetPair(medal: MedalKind, timeMs: number): HTMLSpanElement {
+  const pair = document.createElement('span');
+  pair.className = 'tpair';
+  const t = document.createElement('span');
+  t.className = 'mtime';
+  t.textContent = fmt(timeMs);
+  pair.append(medalLabelSpan(medal), document.createTextNode(' '), t);
+  return pair;
+}
+// One atomic flex item of plain text: never splits across lines.
+// Built with textContent only, never innerHTML.
+function targetChunk(text: string): HTMLSpanElement {
+  const c = document.createElement('span');
+  c.className = 'tchunk';
+  c.textContent = text;
+  return c;
+}
+// Menu targets line: per-medal colours, atomic pairs in a wrapping flex row.
+// Spacing comes from the flex gap in CSS — no text separators, so no
+// separator can ever dangle at a line end.
+let lastPtargetsKey = '';
+function renderMenuTargets(): void {
+  const key = `menu:${best}`;
+  if (key === lastPtargetsKey) return;
+  lastPtargetsKey = key;
+  ptargets.replaceChildren();
+  const t = course.targets;
+  if (best > 0) {
+    const m = medalFor(best, t);
+    ptargets.append(targetChunk(`BEST ${fmt(best)}`));
+    if (m === 'none') ptargets.append(targetChunk('NO MEDAL YET'));
+    else ptargets.append(medalLabelSpan(m));
+    ptargets.append(targetPair('gold', t.goldMs));
+    return;
+  }
+  const label = document.createElement('span');
+  label.className = 'tlabel';
+  label.textContent = 'TARGETS —';
+  ptargets.append(label);
+  ptargets.append(targetPair('gold', t.goldMs));
+  ptargets.append(targetPair('silver', t.silverMs));
+  ptargets.append(targetPair('bronze', t.bronzeMs));
+}
+// Finish targets line: same medal colours for the next-target mention; each
+// logical chunk is one atomic flex item (prefix/next/sectors), so wrapping
+// always happens between chunks. Free-text parts stay text nodes so nothing
+// can inject markup.
+function renderFinishTargets(prefix: string, next: string, sectors: string): void {
+  const key = `finish:${prefix}|${next}|${sectors}`;
+  if (key === lastPtargetsKey) return;
+  lastPtargetsKey = key;
+  ptargets.replaceChildren();
+  const cleanPrefix = prefix.replace(/\s*·\s*$/, '');
+  if (cleanPrefix) ptargets.append(targetChunk(cleanPrefix));
+  if (next) {
+    const m = next.match(/^(next )?((?:GOLD|SILVER|BRONZE))([\s\S]*)$/);
+    if (m) {
+      const chunk = document.createElement('span');
+      chunk.className = 'tchunk';
+      if (m[1]) chunk.append(document.createTextNode(m[1]));
+      chunk.append(medalLabelSpan(m[2].toLowerCase() as MedalKind));
+      chunk.append(document.createTextNode(m[3]));
+      ptargets.append(chunk);
+    } else {
+      ptargets.append(document.createTextNode(next));
+    }
+  }
+  if (sectors) ptargets.append(targetChunk(sectors));
+}
 const stopBtn = document.getElementById('stopbtn') as HTMLButtonElement;
 // Header shows the real date only for daily; fixed courses must not leak the
 // internal 2026-01-01/02 identity day.
@@ -846,14 +932,6 @@ fsBtn.onclick = () => {
 };
 resumeBtn.onclick = () => setPaused(false);
 pauseMenuBtn.onclick = () => { setPaused(false); toMenu(); };
-function targetText(): string {
-  const t = course.targets;
-  if (best > 0) {
-    const m = medalFor(best, t);
-    return `BEST ${fmt(best)} · ${m === 'none' ? 'NO MEDAL YET' : m.toUpperCase()} · GOLD ${fmt(t.goldMs)}`;
-  }
-  return `TARGETS — GOLD ${fmt(t.goldMs)} · SILVER ${fmt(t.silverMs)} · BRONZE ${fmt(t.bronzeMs)}`;
-}
 function menuResultText(): string {
   const parts: string[] = [];
   if (best > 0) parts.push(`Your best ${fmt(best)}`);
@@ -880,7 +958,7 @@ function toMenu() {
   panel.classList.remove('hidden');
   car.visible = true;
   ghostCar.visible = !!sharedGhost;
-  msgEl.textContent = '';
+  setMsg('');
   deltaEl.textContent = ''; deltaEl.className = '';
   timeEl.textContent = '0:00.00';
   speedEl.textContent = '0 km/h';
@@ -900,7 +978,7 @@ function startWatch() {
   state = 'watch';
   car.visible = false; // demo only: no player car, no PB
   ghostCar.visible = true;
-  msgEl.textContent = 'REFERENCE — DEMONSTRATION';
+  setMsg('REFERENCE — DEMONSTRATION');
   lessonEl.textContent = '';
   splitEl.textContent = '';
   deltaEl.textContent = 'REPLAY'; deltaEl.className = '';
@@ -952,7 +1030,7 @@ function doRespawn() {
   // Surface the charge in its own element so it can never overwrite an urgent
   // STUCK / OFF COURSE message, then release the message (no longer stuck).
   showPenaltyToast(performance.now());
-  msgEl.textContent = '';
+  setMsg('');
 }
 placeAt(0);
 camera.position.set(sim.px - 10, sim.py + 6, sim.pz - 10);
@@ -987,7 +1065,7 @@ function startRun(quick = false) {
   splitEl.textContent = display.split;
   debugEl.textContent = display.debug;
   lastInfo = neutralRunInfo();
-  msgEl.textContent = '';
+  setMsg('');
   clearPenalty();
   clearSkids();
   clearExitFeedback();
@@ -1035,6 +1113,7 @@ canvas.addEventListener('pointerdown', () => { ensureAudio(); if (state === 'men
     shouldUseNativeShare(coarse, typeof navigator.share === 'function'),
   );
   presult.textContent = outcome.message;
+  presult.classList.remove('finish');
 };
 
 // ---------- physics wrapper: sim advances, this renders ----------
@@ -1116,16 +1195,17 @@ function finishRun() {
     : `+${fmt(finalMs - prevBest)} vs best`;
   const medalStr = medal === 'none' ? 'no medal' : `${medal.toUpperCase()} medal`;
   presult.textContent = `${fmt(finalMs)} · ${medalStr} · ${verdict} · best ${fmt(best)}${sharedTime ? ` · friend ${fmt(sharedTime)}` : ''}`;
+  presult.classList.add('finish');
   // Real sector gains/losses vs the racing ghost only; blank with no valid ghost.
   const ghostSplits = sharedGhost ? splitIdx.map((j) => ghostTimeAt(sharedGhost as GhostData, track.x[j], track.z[j])) : [];
   const sectors = sectorSummaryText(sectorDeltas(runSplits, ghostSplits));
-  ptargets.textContent = `${ghostIsReference ? 'REFERENCE · ' : ''}${nextTargetText(best, course.targets)}${sectors ? ` · ${sectors}` : ''}`;
+  renderFinishTargets(ghostIsReference ? 'REFERENCE · ' : '', nextTargetText(best, course.targets), sectors);
   document.body.classList.remove('racing');
   panel.classList.remove('hidden');
   const driveBtn = document.getElementById('drivebtn') as HTMLButtonElement;
   driveBtn.textContent = 'RETRY (Enter)';
   driveBtn.focus();
-  msgEl.textContent = '';
+  setMsg('');
   // The toast expiry only runs in the run branch, so a rescue on the finish
   // step would otherwise leave "+3s" on screen through the result panel.
   clearPenalty();
@@ -1182,7 +1262,7 @@ function frame(now: number) {
     camera.position.set(gp.x - Math.sin(gp.h) * 12, gp.y + 5, gp.z - Math.cos(gp.h) * 12);
     camera.lookAt(gp.x, gp.y + 1, gp.z);
     if (watchT > lastT + 700) {
-      msgEl.textContent = 'REFERENCE COMPLETE';
+      setMsg('REFERENCE COMPLETE');
       if (watchT > lastT + 1600) { toMenu(); return; }
     }
     renderScene();
@@ -1196,8 +1276,9 @@ function frame(now: number) {
     ptitle.textContent = course.title.toUpperCase();
     pdateEl.textContent = mode === 'daily' ? day : '';
     pubEl.textContent = course.description;
-    ptargets.textContent = targetText();
+    renderMenuTargets();
     presult.textContent = menuResultText();
+    presult.classList.remove('finish');
     phintEl.innerHTML = coarse
       ? 'Mobile: left stick steers · tap DRIFT to slide · steer back the other way to exit · RESCUE returns to the track (+3s)<br/>Controls: tap PAUSE to stop the clock · MENU to quit · RETRY restarts'
       : 'PC: ← → steer · ↓ / space drift · R rescue (+3s) · Enter retry · Esc / P pause<br/>Drift: hold a direction, tap DRIFT to start the slide, hold it, then countersteer to exit';
@@ -1213,11 +1294,12 @@ function frame(now: number) {
     countdownT += dt;
     if (cdLen > 1) {
       const k = 3 - Math.floor(countdownT);
-      msgEl.textContent = k > 0 ? String(k) : 'GO!';
+      setMsg(k > 0 ? String(k) : 'GO!', true, k <= 0);
     } else {
-      msgEl.textContent = countdownT > cdLen - 0.25 ? 'GO!' : 'READY';
+      const go = countdownT > cdLen - 0.25;
+      setMsg(go ? 'GO!' : 'READY', true, go);
     }
-    if (countdownT > cdLen) { state = 'run'; msgEl.textContent = ''; }
+    if (countdownT > cdLen) { state = 'run'; setMsg(''); }
     renderScene();
     return;
   }
@@ -1303,11 +1385,11 @@ function frame(now: number) {
         if (fresh.wallHit === true) audio.oneShot('crash', clamp(fresh.wallSev ?? 0.5, 0.2, 1));
         else if (fresh.landed) audio.oneShot('land', clamp(Math.abs(fresh.landV) / 12, 0.2, 1));
       }
-      if (info.stuckMs > 1500) msgEl.textContent = stuckPrompt(coarse);
-      else if (info.oobMs > 900) msgEl.textContent = offCoursePrompt(coarse);
-      else if (info.offroad && sim.grounded && info.spd > 12) msgEl.textContent = 'LOW GRIP — DIRT';
-      else if (info.drifting) msgEl.textContent = 'DRIFT';
-      else if (msgEl.textContent === 'DRIFT' || msgEl.textContent.startsWith('STUCK') || msgEl.textContent.startsWith('OFF COURSE') || msgEl.textContent === 'LOW GRIP — DIRT') msgEl.textContent = '';
+      if (info.stuckMs > 1500) setMsg(stuckPrompt(coarse));
+      else if (info.oobMs > 900) setMsg(offCoursePrompt(coarse));
+      else if (info.offroad && sim.grounded && info.spd > 12) setMsg('LOW GRIP — DIRT');
+      else if (info.drifting) setMsg('DRIFT');
+      else if (msgEl.textContent === 'DRIFT' || msgEl.textContent.startsWith('STUCK') || msgEl.textContent.startsWith('OFF COURSE') || msgEl.textContent === 'LOW GRIP — DIRT') setMsg('');
       // ghost playback: interpolated, holds finish pose (never loops)
       if (sharedGhost && sharedGhost.p.length > 1) {
         const gp = sampleGhost(sharedGhost, ghostMs);

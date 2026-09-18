@@ -2,7 +2,34 @@
 // tests/corner-apex.ts. Extracted verbatim from courses.ts so both suites drive
 // the SAME policy against the frozen Trackmania physics (cruise 140 / drift 112).
 import { clamp } from '../src/sim.js';
+import { barrierAt } from '../src/barrier-plan.js';
 import type { SimState, StepInput, TrackView } from '../src/sim.js';
+
+// Off-road trigger for the rejoin policy, in units past the half-width.
+// Calibrated 2026-09-17 against the new (110) acceleration: the fastest clean
+// skilled runs peak at 13.25u of nearest-index lateral offset on benchmark
+// (11.9u on dailies), so halfW + 2.0 never fires on clean pace and only
+// engages once the car is genuinely off the surface.
+export const REJOIN_LAT = 2.0;
+
+// Fold-safe distance from the car to its progress window: the minimum
+// Euclidean distance to samples lastIdx +/- 10. A wide-window Euclidean
+// nearest was tried first and rejected: it jumps across hairpin folds (an
+// across-infield leg 60u ahead reads as "near") and stormed 108 prompt
+// respawns on 06-15 in testing. This window is topological — it only sees
+// the road the progress tracker sees — so normal driving (folds, hairpins,
+// crest flights) always reads small. Clean-run ceiling measured 2026-09-17:
+// 13.25u (benchmark brush).
+export function windowDist(s: SimState, tr: TrackView): number {
+  let bd = Infinity;
+  for (let k = -10; k <= 10; k++) {
+    const i = clamp(s.lastIdx + k, 0, tr.n - 1);
+    const dx = tr.x[i] - s.px, dz = tr.z[i] - s.pz;
+    const d = dx * dx + dz * dz;
+    if (d < bd) bd = d;
+  }
+  return Math.sqrt(bd);
+}
 
 export function makeBot(handbrake: boolean) {
   const traps: number[] = [];
@@ -13,6 +40,34 @@ export function makeBot(handbrake: boolean) {
     const tier = nearTrap ? 2 : Math.min(Math.floor(respawns / 2), 2);
     const cap = tier === 0 ? 112 : tier === 1 ? 95 : 80;
     const spd = Math.hypot(s.vx, s.vz);
+    // Rejoin (2026-09-17 course retune): once the car is past clamp reach
+    // outside the road the rail clamp no longer rescues it, and the
+    // lastIdx-anchored pursuit below aims from a frozen frame — it steers at
+    // a stale point, slaloms across the road and spins instead of rejoining
+    // (measured: 07-11 s~3620 crosses to +121u out; 06-15 s~3022 spins to a
+    // crawl). Navigate back toward the progress window instead: grip-only
+    // pure pursuit to a point on the road just ahead of lastIdx, with a
+    // short lead so the intercept hooks back near progress (a far-downtrack
+    // target crosses the road shallow and ping-pongs off the far edge —
+    // measured 07-28 s~2859 out to -62u). Driving back inside the sim's ~12u
+    // progress margin unfreezes lastIdx and the attack policy resumes. The
+    // trigger keys on the topological window distance, never the Euclidean
+    // nearest (which jumps hairpin folds); it never fires on clean pace
+    // (see windowDist calibration).
+    const wD = windowDist(s, tr);
+    if (wD > tr.halfW + REJOIN_LAT) {
+      if (Math.abs(prevSlip) > 0.5) return { steer: clamp(-prevSlip * 4, -1, 1), drift: false };
+      const RL = 10 + spd * 0.3;
+      let ri = Math.max(0, Math.min(s.lastIdx, tr.n - 1)), racc = 0;
+      while (ri < tr.n - 1 && racc < RL) {
+        racc += Math.hypot(tr.x[ri + 1] - tr.x[ri], tr.z[ri + 1] - tr.z[ri]); ri++;
+      }
+      const rdx = tr.x[ri] - s.px, rdz = tr.z[ri] - s.pz;
+      let rang = Math.atan2(rdx, rdz) - s.heading;
+      while (rang > Math.PI) rang -= 2 * Math.PI;
+      while (rang < -Math.PI) rang += 2 * Math.PI;
+      return { steer: clamp(-rang * 2.0, -1, 1), drift: false };
+    }
     const L = 12 + spd * 0.7;
     let li = s.lastIdx, acc = 0;
     while (li < tr.n - 1 && acc < L) {
@@ -129,6 +184,28 @@ export function makeBot(handbrake: boolean) {
         : (handbrake && spd > 34 && minR < 200 && engaged && spd > vth(rNow) + enterOver);
       if (want) return { steer: commitNear(Math.min(dEntry, 199)), drift: true };
       return { steer: pursuit, drift: false };
+    }
+    // Open-edge respect (2026-09-17 course retune): fast sweepers the policy
+    // grips flat (minR 160+) are committable only with a rail to catch a
+    // slide — through an OPEN outside edge the same grip line is an
+    // uncatchable fly-off (measured: 07-11 s~3620, 06-15 s~3644, 07-28
+    // s~3152 leave at 121-127 u/s and never rejoin; the sim's anti-cut
+    // window cannot credit a rejoin 100u+ ahead of frozen progress). The rail
+    // plan is visible track furniture, so take the slowing drift on the same
+    // brake timing when the upcoming bend's outside is unguarded (bot-dir to
+    // outside-side mapping measured on 07-28: L reads dh>0/dir -1 with
+    // outside +1, so outside = -dir). Guarded sweepers keep the proven grip
+    // line; the grip-only (conservative) policy is untouched.
+    if (handbrake && spd > 34 && engaged && minR >= 160 && minR < 200 && dEntry !== Infinity) {
+      const vttO = vth(minR);
+      const brakeDO = (spd * spd - vttO * vttO) / 80 + 40;
+      if (spd > vttO + 6 && dEntry < brakeDO) {
+        const dirO = dirEntry !== 0 ? dirEntry : dirMin;
+        const bendS = sNow + Math.min(dEntry, 199);
+        const open = tr.barrier == null ? false
+          : !barrierAt(tr.barrier, bendS + 20, (-dirO) as 1 | -1);
+        if (dirO !== 0 && open) return { steer: flick, drift: true };
+      }
     }
     if (handbrake && spd > 34 && engaged && minR < 160) {
       const vtt = vth(minR);

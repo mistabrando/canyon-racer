@@ -538,3 +538,86 @@ Mixing Muse Spark and normal GPT:
   ghost/loop QA on GPT.
 
 Muse-only policy (2026-09-08 ~09:30, user request): GPT workers retired. Art reprompted on Muse Spark after two dead GPT attempts (bad slugs, then reaped shells); driving/loop/pages reports already on disk. `run-codex.sh` now forces muse for any `--model gpt` request. Active worker: cycle9-art on muse-spark only.
+
+## Cycle 10 — off-track feel, acceleration, UI readability (2026-09-17)
+
+User feedback: *"weird physics when I fall off the track — do not reset me by
+default, just let the user spin around; acceleration a little too much now;"* and
+*"improve the UI — note the text is too small in some cases."* Plus an explicit
+request to run Muse Spark contributor workers in parallel.
+
+Launched via `.muse/launch-worker.sh <name>` (new helper; one `CODEX_HOME` per
+worker, detached in tmux `muse-<name>`, logs in `.muse/logs/<name>.log`).
+
+| Workstream | Prompt | Owned files | Status |
+|---|---|---|---|
+| Off-track freedom + acceleration | `.muse/prompts/physics.md` | `src/sim.ts`, `tests/physics-feel.ts`, `tests/harness.ts` | complete |
+| Directional signage on boards | `.muse/prompts/signs.md` | `src/visuals.ts`, `tests/visuals-budget.ts` | complete |
+| Off-track measurement/evidence | `.muse/prompts/offtrack-probe.md` | `.muse/offtrack-probe.mjs`, `docs/agents/offtrack-diagnosis-2026-09-17.md` | complete |
+| UI text/readability audit | `.muse/prompts/ui-audit.md` | `docs/agents/ui-audit-2026-09-17.md` | complete |
+| HUD/panel legibility (F1-F5) | `.muse/prompts/ui-polish.md` | `src/style.css`, `src/main.ts` | complete |
+| Narrow-width collision + medal wrap | `.muse/prompts/ui-narrow.md` | `src/style.css`, `src/main.ts` | complete |
+| Bot/script/reference recalibration | `.muse/prompts/course-retune.md` | `tests/informed-bot.ts`, `tests/corner-apex.ts`, `src/course-reference.ts` | complete |
+
+### Cycle 10 result (all 16 suites green, verified by the integrator)
+
+Independently re-run after every worker stopped: `npm test` -> 276 / 231 / 117 / 263 /
+56 / 108 / 197 / 28 / 34 / 41 / 49 / 45 / 68 / 41 / 46 / 86, **0 failures, exit 0**;
+`npx tsc --noEmit` clean; `npm run build` clean (bundle 586491 B). Net +23 checks vs
+the pre-cycle baseline (`physics-feel` 214 -> 231, `visuals-budget` 258 -> 263,
+`courses` 85 -> 86).
+
+Integrity audit of the recalibration: `tests/courses.ts` has **zero diff**;
+`tests/corner-apex.ts` changed only script *inputs* (`startS+60 -> +80`, blip
+`3+3 @ 0.4 -> 2+2 @ 0.3`) with the assertions byte-identical; no assertion anywhere
+was deleted, widened or made vacuous. New coverage was added, not traded away.
+
+Regression-and-recovery honesty: `course-retune` reported that most of the "failing"
+seeds already failed at HEAD, that the true regressions were one seed per gate, and
+that `daily 2026-06-04` still does not finish (it also did not at HEAD) — recorded
+rather than papered over. It also documented two rejected approaches
+(straight-line drift-scrub; Euclidean-nearest recovery) so they are not retried.
+
+Verification method note: the harness at `/tmp/ui-verify/check.js` measures computed
+font sizes, viewport width and every element that overflows the viewport, and writes
+PNGs. It is necessary but NOT sufficient — `ui-polish` measured all-green while a
+visible `#day`/timer text collision remained. Always look at the PNGs.
+
+
+### Root cause of "weird off-track physics" (probe evidence, headless)
+
+There is **no auto-reset**: the only teleport is `simRespawn()` (manual R), and
+`OOB` only arms the `OFF COURSE — R RESET` prompt. Measured per-step
+required-vs-actual displacement mismatch is **0.000**, so nothing clamps or snaps
+the car. The real artifacts:
+
+1. **Perpetual off-road equilibrium + yaw limit-cycle.** Once past the shoulder the
+   car asymptotes to ~28.9 u/s (`ACCEL_OFFROAD 16` against `OFFROAD_DRAG 0.5` plus
+   scrub) and then holds a repeating yaw pattern (`…1.955, 0.115, -2.185, 0.115,
+   1.955…`) while travelling in a straight line — reaching `lat 2018` at `t 76s`
+   with `oobMs` still climbing. The car is not "stuck" so much as cruising an
+   infinite plain in a deterministic self-sustaining wobble.
+2. **Off-road body pitch was driven by the road grade** at the nearest centreline
+   sample, so a car on the flat dirt plain was rendered tilting with a slope that
+   was not under it. Fixed by sampling `groundSurfaceY` along the heading.
+3. **Rail clamp reach**: the clamp fired at any lateral distance on a guarded span,
+   which could yank a car that had legitimately driven out through an opening back
+   to the contact plane (a multi-unit displacement = "it reset me"). Now gated by
+   `WALL_CLAMP_REACH` so only shallow, in-step penetrations clamp; legacy
+   null-barrier tracks keep collide-everywhere.
+
+Acceleration: `ACCEL_ROAD` 140 → 110 (~−21%), with `ACCEL_BOOST_MAKEUP` restoring
+the old punch only while a one-shot exit/rhythm boost window is live, so the timed
+slingshot surge is unchanged and only plain launch/drive accel is gentler.
+
+UI: the mobile `@media (max-width:430px)` block was **backwards** — it shrank five
+elements (including the speed readout to 11px and the mobile RESCUE button to 11px)
+on the platform that needs larger type. Replaced with a ≥13px floor, explicit
+`#best` ellipsis, reserved `min-height` so wrapping rescue prompts cannot shove the
+HUD mid-crisis, a top scrim for white-on-bright-rock contrast, and a dark pill
+behind the yellow `RESCUE +3s` toast (~1.3:1 on sand otherwise). All touch targets
+raised to ~44px with the RESCUE/RETRY vertical offset coupling resolved.
+
+Integration rule reminder: workers do not touch `src/main.ts`, `index.html`,
+`src/style.css`, `package.json`, configs, `dist/`, or `test-dist/`; the integrator
+runs the final full `npm test`, build, and browser QA.
